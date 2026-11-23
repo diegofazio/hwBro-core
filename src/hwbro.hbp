@@ -1,0 +1,26 @@
+# ============================================================
+#  hwbro.hbp - Proyecto hwBro (reconstruccion Harbour/Win32)
+#  Build:  build.bat   (en la raiz del proyecto)
+# ============================================================
+# salida: el .exe queda en la raiz del proyecto (..\hwbro.exe)
+-o..\hwbro
+-gui
+-gtwvg
+hwbro.prg
+bp_ui.prg
+bp_core.prg
+bp_struct.prg
+bp_cmds.prg
+bp_dot.prg
+bp_hc.prg
+bp_link.prg
+bp_win32.c
+# icono de la aplicacion + propiedades del ejecutable (hbmk2 lo compila con rc.exe)
+hwbro.rc
+# S42: zip engine (hbziparc + hbmzip + minizip)
+hbziparc.hbc
+# S6 of odd/tasks/list-to-print.md: the printers of Windows (win_printerList(),
+# win_printerGetDefault(), win_PrintFileRaw()). The .hbc asks for the STATIC
+# hbwin library, which is what C:\harbour\lib\win\msvc\hbwin.lib is: hwbro.exe
+# does NOT depend on hbwin-32-x64.dll being on the PATH.
+hbwin.hbc

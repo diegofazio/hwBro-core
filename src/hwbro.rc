@@ -1,0 +1,44 @@
+// hwbro.rc - recursos de hwBro (icono de la aplicacion y propiedades del exe)
+//
+// Lo compila hbmk2 porque el .hbp lo lista, con el rc.exe que deja disponible
+// build.bat al cargar vcvarsall.bat. El icono (hwbro.ico) se genera a partir de
+// ico.png con el script del proyecto; ver AGENTS.md.
+//
+// IDI_MAIN = 1: es el PRIMER icono del ejecutable, o sea el que Windows usa para
+// el archivo en el Explorador y el que bp_win32.c carga para la ventana
+// (WM_SETICON), asi que ambos muestran el mismo dibujo.
+
+#include <windows.h>
+
+#define IDI_MAIN 1
+
+IDI_MAIN ICON "hwbro.ico"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    3,0,0,0
+ PRODUCTVERSION 3,0,0,0
+ FILEFLAGSMASK  0x3fL
+ FILEFLAGS      0x0L
+ FILEOS         VOS_NT_WINDOWS32
+ FILETYPE       VFT_APP
+ FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "0C0A04B0"                    // espanol (Argentina), Unicode
+        BEGIN
+            VALUE "CompanyName",      "hwBro"
+            VALUE "FileDescription",  "hwBro - reconstruccion nativa de BroPlus 3.00"
+            VALUE "FileVersion",      "3.00"
+            VALUE "InternalName",     "hwbro"
+            VALUE "LegalCopyright",   "hwBro"
+            VALUE "OriginalFilename", "hwbro.exe"
+            VALUE "ProductName",      "hwBro"
+            VALUE "ProductVersion",   "3.00"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0C0A, 1200
+    END
+END
