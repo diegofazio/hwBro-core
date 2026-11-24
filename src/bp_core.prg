@@ -124,7 +124,11 @@ FUNCTION CoreSetDir( c )
    ENDIF
 RETURN s_cDir
 FUNCTION CoreOpenMode()    ; RETURN s_cOpenMode
-FUNCTION CoreToggleMode()  ; s_cOpenMode := iif( s_cOpenMode == "SHARED", "EXCLUSIVE", "SHARED" ) ; RETURN s_cOpenMode
+FUNCTION CoreSetOpenMode( c )
+   s_cOpenMode := iif( Upper( iif( ValType( c ) == "C", c, "" ) ) == "SHARED", "SHARED", "EXCLUSIVE" )
+   Set( _SET_EXCLUSIVE, ( s_cOpenMode == "EXCLUSIVE" ) )
+RETURN s_cOpenMode
+FUNCTION CoreToggleMode()  ; RETURN CoreSetOpenMode( iif( s_cOpenMode == "SHARED", "EXCLUSIVE", "SHARED" ) )
 
 /* REAL mode of the active area ("SHARED"/"EXCLUSIVE"), which is what the bars
  * have to show. With no database open it returns the SETTING, that is the
@@ -146,11 +150,17 @@ RETURN c
 FUNCTION CoreModeName()
 RETURN iif( CoreRealMode() == "SHARED", "Shared", "Exclusive" )
 FUNCTION CoreHideDel()     ; RETURN s_lHideDel
-FUNCTION CoreToggleHideDel() ; s_lHideDel := ! s_lHideDel ; Set( _SET_DELETED, s_lHideDel ) ; RETURN s_lHideDel
+/* explicit setters: the ini of the session has to SET (not only toggle), and the
+ * toggle rows of the F6 GlobalSet go through them so there is ONE copy of each
+ * rule (the value is validated in the api, not in the ini parser) */
+FUNCTION CoreSetHideDel( l ) ; s_lHideDel := ( l == .T. ) ; Set( _SET_DELETED, s_lHideDel ) ; RETURN s_lHideDel
+FUNCTION CoreToggleHideDel() ; RETURN CoreSetHideDel( ! s_lHideDel )
 FUNCTION CoreSoftSeek()    ; RETURN s_lSoftSeek
-FUNCTION CoreToggleSoftSeek() ; s_lSoftSeek := ! s_lSoftSeek ; Set( _SET_SOFTSEEK, s_lSoftSeek ) ; RETURN s_lSoftSeek
+FUNCTION CoreSetSoftSeek( l ) ; s_lSoftSeek := ( l == .T. ) ; Set( _SET_SOFTSEEK, s_lSoftSeek ) ; RETURN s_lSoftSeek
+FUNCTION CoreToggleSoftSeek() ; RETURN CoreSetSoftSeek( ! s_lSoftSeek )
 FUNCTION CoreCellEdit()    ; RETURN s_lCellEdit
-FUNCTION CoreToggleCellEdit() ; s_lCellEdit := ! s_lCellEdit ; RETURN s_lCellEdit
+FUNCTION CoreSetCellEdit( l ) ; s_lCellEdit := ( l == .T. ) ; RETURN s_lCellEdit
+FUNCTION CoreToggleCellEdit() ; RETURN CoreSetCellEdit( ! s_lCellEdit )
 FUNCTION CoreIncrSeek()    ; RETURN s_lIncrSeek
 FUNCTION CoreToggleIncrSeek() ; s_lIncrSeek := ! s_lIncrSeek ; RETURN s_lIncrSeek
 FUNCTION CoreMemoWidth()   ; RETURN s_nMemoWidth

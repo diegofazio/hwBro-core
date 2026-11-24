@@ -436,6 +436,10 @@ STATIC s_lHcHook := .F.
 /* confirmation hook of the file operations (NIL = ask with UiConfirm()). The
  * headless bank sets it with HcSetConfirmHook() and then NO window is needed. */
 STATIC s_bHcConfirm := NIL
+/* "Save configuration" hook (Commander > Commands): hwbro.prg installs BpCfgSave()
+ * here because this module is also linked by the headless bank, which has no
+ * bp_cfg.prg. With no hook the row says it is not available. */
+STATIC s_bHcCfgSave := NIL
 /* progress of the file operations: bytes done / total and the <Esc> flag */
 STATIC s_nHcProgDone := 0
 STATIC s_nHcProgTotal := 0
@@ -8190,6 +8194,7 @@ STATIC FUNCTION HcMenuCmds()
    NEXT
 
    AAdd( aItems, { "~T~hemes", HcMenuSubMark(), NIL, "", aSub } )
+   AAdd( aItems, { "Save ~C~onfiguration", "", {|| HcCfgSave() }, "" } )
    AAdd( aItems, { "~Q~uit", "F10", {|| HcQuit() }, "" } )
 
 RETURN aItems
@@ -17300,6 +17305,21 @@ RETURN
 /* the confirmation hook of the headless bank: {| cText, cTitle | lYes } */
 FUNCTION HcSetConfirmHook( bBlock )
    s_bHcConfirm := bBlock
+RETURN NIL
+
+/* "Save configuration" of the Commander (Commands > Save configuration). The
+ * work itself lives in bp_cfg.prg, which this module cannot call (the headless
+ * bank links bp_hc.prg without it), so hwbro.prg hands the block in here. */
+FUNCTION HcSetCfgHook( bBlock )
+   s_bHcCfgSave := bBlock
+RETURN NIL
+
+STATIC FUNCTION HcCfgSave()
+   IF hb_IsNIL( s_bHcCfgSave )
+      UiErr( "Save configuration is not available in this screen.", "hwBro" )
+      RETURN NIL
+   ENDIF
+   Eval( s_bHcCfgSave )
 RETURN NIL
 
 /* Overwrite hook of the headless bank (S17): {| cName, cSrc, cDst | nChoice },

@@ -14,6 +14,7 @@ bp_cmds.prg
 bp_dot.prg
 bp_hc.prg
 bp_link.prg
+bp_cfg.prg
 bp_win32.c
 # icono de la aplicacion + propiedades del ejecutable (hbmk2 lo compila con rc.exe)
 hwbro.rc

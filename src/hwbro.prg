@@ -138,6 +138,10 @@ PROCEDURE Main( xArg )
     * seen at once. Without this hook (every headless bank) the pairs still switch
     * and only the palette stays as it was. */
    UiSetThemeHook( {|| BpSetVgaPalette() } )
+   /* "Save configuration" of the Harbour Commander (Commands): the row is drawn
+    * by bp_hc.prg, which cannot call bp_cfg.prg (the headless bank links it
+    * alone), so the work is handed in as a block. */
+   HcSetCfgHook( {|| BpCfgSave() } )
    Set( _SET_SCOREBOARD, .F. )
    /* The CANCEL handler terminates the program on Ctrl+<key>, and on a Spanish
     * keyboard AltGr IS Ctrl+Alt: AltGr+C (and Alt+C on some layouts) closed
@@ -159,6 +163,14 @@ PROCEDURE Main( xArg )
     * engine, which is why the select opens on the tenth picture. */
    UiDateFormatInit()
    CoreInit()
+   /* hwbro.ini (the file NEXT TO THE EXECUTABLE): the GlobalSet of the DB
+    * manager and the theme the program starts with. It is applied AFTER
+    * CoreInit() and after the two startup defaults (epoch 1950 and dd/mm/yyyy),
+    * so what the user saved wins; with no file - or with a value the screen
+    * could not produce - the defaults stay exactly as they were. The theme is
+    * switched here too, and the palette hook installed above retunes the RGB of
+    * the driver in the act, before the splash is painted. */
+   BpCfgLoad()
    /* A6 of odd/tasks/f2-dbmanager.md: A DATABASE DROPPED ON THE EXECUTABLE.
     * Windows runs `hwbro.exe "C:\...\CLIENTES.DBF"` and what the user asked for
     * is that database in the DB manager and NOTHING else: no splash - it waits
@@ -1001,7 +1013,9 @@ RETURN { ;
       { "E~p~och: " + LTrim( Str( UiDateEpoch() ) ), "", {|| BpGlobEpoch() } }, ;
       { "~C~ell Edit: " + iif( CoreCellEdit(), "ON", "OFF" ), "", {|| BpGlobToggleCellEdit() } }, ;
       { "H~I~de Deleted Recs is " + iif( CoreHideDel(), "ON", "OFF" ), "Alt-D", {|| BpGlobToggleHideDel() } }, ;
-      { "~S~oftseek is " + iif( CoreSoftSeek(), "ON", "OFF" ), "Alt-Q", {|| BpGlobToggleSoftSeek() } } ;
+      { "~S~oftseek is " + iif( CoreSoftSeek(), "ON", "OFF" ), "Alt-Q", {|| BpGlobToggleSoftSeek() } }, ;
+      { "", "", NIL }, ;
+      { "Sa~V~e Configuration", "", {|| BpCfgSave() } } ;
    }, ;
    { ;
       { "~S~eek",          "Alt-S",   {|| BpRecSeek() } }, ;
