@@ -1259,7 +1259,7 @@ STATIC FUNCTION BpMenuHdr( nMenu )
       ENDIF
       RETURN { ;
          { "Selected Database:", iif( Empty( cFile ), "None", cFile ) }, ;
-         { "Current Index:", "(1/1) " + Upper( Alias() ) + ".CDX" }, ;
+         { "Current Index:", BpIdxHeaderText() }, ;
          { "Current Tag:", "(" + LTrim( Str( BpTagPos() ) ) + "/" + LTrim( Str( BpTagCount() ) ) + ") " + OrdName() }, ;
          { "Key:", "(" + CoreKeyExpr() + ")" } }
    ENDCASE

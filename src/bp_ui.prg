@@ -41,6 +41,9 @@ STATIC s_nProgTotal := 0
 STATIC s_nProgPct   := -1
 STATIC s_cProgText  := ""
 STATIC s_lProgEsc   := .F.
+/* tick of the last repaint of the progress box: the throttle of UiProgUpdate()
+ * - see PROG_REFRESH_MS */
+STATIC s_nProgMs    := 0
 /* Click source of the modals of this module: a block {|| { row, column } } that
  * answers NIL when there was no click. hwbro.prg installs the one that reads
  * the window hook of bp_win32.c; with no hook - every headless bank, and any
@@ -2637,14 +2640,14 @@ RETURN
  * Both default to "", and with them empty the field behaves EXACTLY as before
  * (the three headless banks pin that: S100/S115). */
 FUNCTION UiLineEdit( nRow, nCol, nLen, cValue, lDigitsOnly, cColor, lUpper, lTabNav, ;
-                    cMask, cAccept, lSelAll )
+                    cMask, cAccept, lSelAll, lNoAltClose )
    LOCAL cBuf, nPos, nKey, cOldCur, lDone := .F., aKey, lCancel := .F.
    LOCAL lInsert := .F., lShift := .F., nSelFrom, nSelTo, nAnchor
    LOCAL aPt, nClip, aRes
    DEFAULT cValue TO "" ; DEFAULT lDigitsOnly TO .F.
    DEFAULT cColor TO UI_C_INPUT ; DEFAULT lUpper TO .F.
    DEFAULT lTabNav TO .F. ; DEFAULT cMask TO "" ; DEFAULT cAccept TO ""
-   DEFAULT lSelAll TO .F.
+   DEFAULT lSelAll TO .F. ; DEFAULT lNoAltClose TO .F.
    IF Len( cMask ) > 0
       /* the separators of the layout are stamped in, and the caret starts on
        * the first EDITABLE cell: a masked field never rests on a separator */
@@ -2710,8 +2713,14 @@ FUNCTION UiLineEdit( nRow, nCol, nLen, cValue, lDigitsOnly, cColor, lUpper, lTab
        * text- and the editor CLOSES keeping the value it has; the chord stays
        * pending for the caller (UiAltChord()), which is what makes `Alt+S` run
        * the button of the screen instead of typing an `s`. With no hook there
-       * is nothing pending and the loop goes on exactly as before. */
-      IF Len( UiAltAsk() ) > 0
+       * is nothing pending and the loop goes on exactly as before.
+       * lNoAltClose: a PLAIN UiInput() is not a form and has no Alt hot keys of
+       * its own, so it does NOT close on a chord. Without this an accelerator
+       * that opens an input (Alt-S = Seek) died at once: the ALT ring is fed by
+       * WM_SYSCHAR AFTER the accelerator already ran, the field saw the chord
+       * and left with an empty value ("Not found."). That is the red A1 of
+       * _reversing/verifica-menu-accels.ps1 since the Alt hook exists. */
+      IF ! lNoAltClose .AND. Len( UiAltAsk() ) > 0
          s_nUiEditExit := K_ENTER
          lDone := .T.
          EXIT
@@ -2827,7 +2836,11 @@ FUNCTION UiInput( cPrompt, cValue, nWidth, lSelAll )
     * of this program (skill pantallas-de-formulario): grey `UI_C_FIELDBG` is for
     * a field at REST, and this one is the field being typed into */
    cRes := UiLineEdit( nT + 2, nL + 2, Min( nWidth, nW ), cValue, .F., UI_C_LISTSEL, ;
-                       .F., .F., "", "", lSelAll )
+                       .F., .F., "", "", lSelAll, .T. )
+   /* this box is not a form and has no Alt hot key of its own: the chord that
+    * opened it (an accelerator) is dropped here so it cannot close the NEXT
+    * field of the screen (the field itself already ignores it, lNoAltClose) */
+   UiAltChord()
    RestScreen( nT, nL, nT + nB + 1, Min( nL + nR + 2, MaxCol() ), cSave )
 RETURN cRes
 
@@ -3088,8 +3101,10 @@ RETURN cStr
  *   UiProgEnd()                     closes the state; the screen underneath is
  *                                   repainted by the caller (not saved here)
  *
- * It only repaints when the percentage changes: one REFRESH per step. That way
- * the process is not slowed down by drawing (100 steps at most, not one per record).
+ * It repaints at most once every PROG_REFRESH_MS, whatever moves (percentage or
+ * text line): a repaint is a full window REFRESH, and refreshing once per record
+ * is what made SUM/AVERAGE and the other long walks crawl. Callers that walk a
+ * whole table also ask UiProgStep() and only call this every n records.
  * The "Cls"/"SetColor" lines are not used: it paints with UiWrite so it does not
  * touch the color of the rest of the screen. */
 
@@ -3101,6 +3116,14 @@ RETURN cStr
 #define PROG_R          ( PROG_L + PROG_W - 1 )
 #define PROG_IN_L       ( PROG_L + 2 )
 #define PROG_IN_W       ( PROG_W - 4 )              /* bar cells */
+/* a repaint of the bar costs a full window REFRESH, so it happens at most once
+ * every this many milliseconds: a walk that moves the percentage on almost every
+ * record (or that passes a per-record text) must not refresh once per record. */
+#define PROG_REFRESH_MS 80
+/* how many times per table the bar is repainted (and the keyboard polled):
+ * 50,000 records give a step of 100, i.e. 500 steps per walk. Repainting and
+ * polling on EVERY record is what made the long walks crawl. */
+#define PROG_STEPS      500
 
 /* { nT, nL, nB, nR } of the progress box, so a caller that has to save and
  * restore the area underneath does not hardcode the rectangle: BpIdxVerify
@@ -3118,6 +3141,7 @@ FUNCTION UiProgBegin( cTitle, nTotal, lCancel )
    s_cProgText  := ""
    s_lProgEsc   := .F.
    s_lProgOn    := .T.
+   s_nProgMs    := 0
    UiPaintBegin()
    UiShadow( PROG_T, PROG_L, PROG_B, PROG_R )
    UiFillBox( PROG_T, PROG_L, PROG_B, PROG_R, UI_C_BOX )
@@ -3131,33 +3155,47 @@ FUNCTION UiProgBegin( cTitle, nTotal, lCancel )
    UiProgUpdate( 0, s_nProgTotal )
 RETURN NIL
 
+/* how many records make ONE progress step: callers that walk a table ask this
+ * once and only touch the bar (and poll the keyboard) on the multiples of the
+ * answer - 50,000 records give a step of 100 - instead of on every record. */
+FUNCTION UiProgStep( nTotal )
+RETURN Max( 1, Int( Max( 0, nTotal ) / PROG_STEPS ) )
+
 /* nDone/nTotal and, optionally, the text line: if cText is passed it is used
  * AS IS instead of "N / total records  P%" (for processes that do not count
  * records, e.g. the tag by tag reindex: "Indexing Tag ART_NOM"). */
 FUNCTION UiProgUpdate( nDone, nTotal, cText )
-   LOCAL nPct, nFill, cLine
+   LOCAL nPct, nFill, cLine, lMove, nNow
    DEFAULT nTotal TO s_nProgTotal, cText TO ""
    IF ! s_lProgOn
       RETURN .F.
    ENDIF
    nPct := iif( nTotal > 0, Min( 100, Int( nDone * 100 / nTotal ) ), 100 )
-   /* it repaints when the percentage OR the text changes (otherwise a step that
-    * does not move the bar would not update the tag name) */
-   IF nPct != s_nProgPct .OR. ! ( cText == s_cProgText )
-      s_nProgPct  := nPct
-      s_cProgText := cText
-      cLine := iif( Empty( cText ), UiProgText( nDone, nTotal, nPct ), cText )
-      nFill := Int( PROG_IN_W * nPct / 100 )
-      UiPaintBegin()
-      IF nFill > 0
-         UiWrite( PROG_T + 2, PROG_IN_L, Replicate( Chr( 219 ), nFill ), UI_C_PROGBAR )
+   /* SPEED: a repaint costs a full window REFRESH (several ms), so the bar is
+    * repainted at most once every PROG_REFRESH_MS whatever moves - the
+    * percentage of a fast walk changes on almost every record and a per-record
+    * REFRESH is exactly what made SUM/AVERAGE crawl. A slow process (a reindex
+    * tag, a copy) calls this far apart and paints every time. */
+   lMove := nPct != s_nProgPct
+   IF lMove .OR. ! ( cText == s_cProgText )
+      nNow := hb_MilliSeconds()
+      IF nNow - s_nProgMs >= PROG_REFRESH_MS
+         s_nProgPct  := nPct
+         s_cProgText := cText
+         s_nProgMs   := nNow
+         cLine := iif( Empty( cText ), UiProgText( nDone, nTotal, nPct ), cText )
+         nFill := Int( PROG_IN_W * nPct / 100 )
+         UiPaintBegin()
+         IF nFill > 0
+            UiWrite( PROG_T + 2, PROG_IN_L, Replicate( Chr( 219 ), nFill ), UI_C_PROGBAR )
+         ENDIF
+         IF nFill < PROG_IN_W
+            UiWrite( PROG_T + 2, PROG_IN_L + nFill, ;
+                     Space( PROG_IN_W - nFill ), UI_C_PROGEMPTY )
+         ENDIF
+         UiWrite( PROG_T + 3, PROG_IN_L, PadR( cLine, PROG_IN_W ), UI_C_PROGTXT )
+         UiPaintEnd()
       ENDIF
-      IF nFill < PROG_IN_W
-         UiWrite( PROG_T + 2, PROG_IN_L + nFill, ;
-                  Space( PROG_IN_W - nFill ), UI_C_PROGEMPTY )
-      ENDIF
-      UiWrite( PROG_T + 3, PROG_IN_L, PadR( cLine, PROG_IN_W ), UI_C_PROGTXT )
-      UiPaintEnd()
    ENDIF
    /* <Esc> cancels: it is checked on EVERY call (even when nothing has to be
     * repainted) so it answers at once in a process of a million records */
@@ -3178,6 +3216,7 @@ FUNCTION UiProgEnd()
    s_nProgPct   := -1
    s_cProgText  := ""
    s_lProgEsc   := .F.
+   s_nProgMs    := 0
 RETURN NIL
 
 /* Progress box WITHOUT a known total: for processes the engine does not report

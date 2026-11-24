@@ -73,7 +73,47 @@ FUNCTION CoreInit()
 RETURN NIL
 
 FUNCTION CoreDriver()      ; RETURN s_cDriver
-FUNCTION CoreSetDriver( c ) ; s_cDriver := c ; rddSetDefault( c ) ; RETURN NIL
+/* Changes the RDD of the SESSION. A database that is ALREADY OPEN keeps the
+ * engine it was opened with, so the current one is REOPENED with the new driver
+ * (record and order preserved): F6 is only reachable from the browser, i.e. with
+ * a database open, and without this the F3 > Create Index File kept offering
+ * .CDX right after choosing DBFNTX (reported by the user). Other areas opened
+ * with "USE ... NEW" from the dot keep their own RDD. */
+FUNCTION CoreSetDriver( c )
+   LOCAL cFile, cAlias, cOrd, nRec
+   IF Empty( c ) .OR. Upper( c ) == Upper( s_cDriver )
+      RETURN NIL
+   ENDIF
+   IF Used()
+      cFile  := CoreFileName()
+      cAlias := Alias()
+      nRec   := RecNo()
+      cOrd   := ""
+      BEGIN SEQUENCE WITH {| e | Break( e ) }
+         cOrd := OrdName()
+      RECOVER
+         cOrd := ""
+      END SEQUENCE
+      CLOSE
+      s_cDriver := c
+      rddSetDefault( c )
+      IF ! CoreOpen( cFile, cAlias )
+         RETURN NIL
+      ENDIF
+      CoreOrdList()
+      BEGIN SEQUENCE WITH {| e | Break( e ) }
+         IF ! Empty( cOrd )
+            OrdSetFocus( cOrd )
+         ENDIF
+         dbGoto( nRec )
+      RECOVER
+         /* the order may not exist in the new engine: the natural one stays */
+      END SEQUENCE
+      RETURN NIL
+   ENDIF
+   s_cDriver := c
+   rddSetDefault( c )
+RETURN NIL
 FUNCTION CoreDir()         ; RETURN s_cDir
 FUNCTION CoreSetDir( c )
    IF ! Empty( c )
@@ -222,8 +262,18 @@ RETURN aRes[ 1 ]
  * The alias of the freshly opened area is used, because it is what the user
  * sees in the bars. */
 STATIC PROCEDURE CoreBagWarn( cFile )
-   LOCAL cBag, cWhat
+   LOCAL cBag, cWhat, lCdx := .F.
    IF Empty( cFile )
+      RETURN
+   ENDIF
+   /* only a database opened with the CDX engine uses that bag: warning about a
+    * .CDX that is not even attached (DBFNTX area) would be noise */
+   BEGIN SEQUENCE WITH {| e | Break( e ) }
+      lCdx := ( Upper( dbOrderInfo( DBOI_BAGEXT ) ) == ".CDX" )
+   RECOVER
+      lCdx := .F.
+   END SEQUENCE
+   IF ! lCdx
       RETURN
    ENDIF
    cBag := CoreBagPath( cFile )
@@ -383,12 +433,27 @@ FUNCTION CoreMemoExt()
    ENDIF
 RETURN c
 
-/* open the index of the current database by default (bag named like the database) */
+/* open the index of the current database by default (bag named like the database).
+ * A BARE name is resolved NEXT TO THE DATABASE FILE, never against the process
+ * working directory (the folder hwBro was started from): resolving it against
+ * the CWD attached the same-named .CDX/.NTX that happened to live in the launch
+ * folder, a database opened from another folder came up with a foreign index
+ * (reported by the user: "el cdx no se busca donde estoy parado sino donde se
+ * ejecuto hwBro"). */
 FUNCTION CoreOrdList( cBag )
-   LOCAL oErr, cBase
-   DEFAULT cBag TO CoreFileBase()
+   LOCAL oErr, c := iif( ValType( cBag ) == "C", AllTrim( cBag ), "" ), cFile, nSep
+   IF Empty( c )
+      c := CoreFileBase()
+   ENDIF
+   IF ! Empty( c ) .AND. Rat( "\", c ) == 0 .AND. Rat( "/", c ) == 0
+      cFile := CoreFileName()
+      nSep := Rat( "\", cFile )
+      IF nSep > 0
+         c := Left( cFile, nSep ) + c
+      ENDIF
+   ENDIF
    BEGIN SEQUENCE WITH {| e | Break( e ) }
-      ORDLISTADD( cBag )
+      ORDLISTADD( c )
    RECOVER USING oErr
       RETURN .F.
    END SEQUENCE
@@ -1737,10 +1802,20 @@ RETURN NIL
 /* row 2: title (FILE name + order) like the original: white strip
  * with the title in a black box with white letters, centered. NOTE: the original
  * uses the file name, NOT the alias (measured after renaming the alias: the
- * title still reads "CLIENTES Order CLIENTES"). */
+ * title still reads "CLIENTES Order CLIENTES").
+ * The ORDER NUMBER goes in parentheses next to the tag name, and 0 (the natural
+ * order, shown as <None>) is part of the ring of Alt-O/Previous Order, so the
+ * title has to say "0" when there is no tag: that number is exactly what
+ * SET ORDER TO takes. */
 STATIC FUNCTION CoreDrawTitle()
    LOCAL cName := iif( Empty( CoreFileName() ), Alias(), CoreFileBase() )
-   LOCAL cT := " " + Upper( cName ) + iif( Empty( OrdName() ), "", " Order " + OrdName() ) + " "
+   LOCAL cOrd := OrdName(), cT
+   IF Empty( cOrd )
+      cT := " " + Upper( cName ) + " Order <None> (0) "
+   ELSE
+      cT := " " + Upper( cName ) + " Order " + cOrd + " (" + ;
+            LTrim( Str( CoreOrdNo() ) ) + ") "
+   ENDIF
    SetColor( UI_C_TITLEBAR )
    @ BP_ROW_TITLE, 0 SAY Replicate( Chr( 219 ), MaxCol() + 1 )
    @ BP_ROW_TITLE, Max( 0, Int( ( MaxCol() + 1 - Len( cT ) ) / 2 ) ) SAY cT

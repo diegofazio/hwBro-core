@@ -2191,6 +2191,31 @@ STATIC FUNCTION BpIdxOpenFiles()
    NEXT
 RETURN a
 
+/* text of the "Current Index:" line of the F3 header: "(n/total) FILE" of the
+ * index FILES open in the area, with the extension the engine really uses
+ * (.CDX / .NTX). With no controlling order it is EMPTY: the header used to
+ * hardcode "(1/1) <ALIAS>.CDX" and claimed a .CDX even for a database that had
+ * NO index at all in its folder (reported by the user). PUBLIC because the
+ * header lives in hwbro.prg. */
+FUNCTION BpIdxHeaderText()
+   LOCAL aOpen := BpIdxOpenFiles(), cCur := "", i, nAt := 0
+   BEGIN SEQUENCE WITH {| e | Break( e ) }
+      IF Used() .AND. ! Empty( OrdName() )
+         cCur := BpTagBagFile( BpTagCur() )
+      ENDIF
+   RECOVER
+      cCur := ""
+   END SEQUENCE
+   IF Empty( cCur )
+      RETURN ""
+   ENDIF
+   FOR i := 1 TO Len( aOpen )
+      IF Upper( aOpen[ i ] ) == Upper( cCur )
+         nAt := i
+      ENDIF
+   NEXT
+RETURN "(" + LTrim( Str( Max( 1, nAt ) ) ) + "/" + ;
+       LTrim( Str( Max( 1, Len( aOpen ) ) ) ) + ") " + Upper( cCur )
 /* full drawing of the screen (all at once, without flicker) */
 STATIC PROCEDURE BpIdxSelDraw( aFiles, nSel, nTop, nVis )
    LOCAL cAlias := "", cMode, nCol
@@ -2639,22 +2664,28 @@ FUNCTION BpIdxSelectScreen()
    SetColor( UI_C_DESKTOP )
 RETURN NIL
 
+/* Alt-O: NEXT ORDER. The ring includes the NATURAL order (0) - asked by the
+ * user - so it is ... nMax -> natural -> 1 ... . With no index at all (nMax = 0)
+ * this is a no-op instead of asking for a tag that does not exist. */
 FUNCTION BpIdxNextOrder()
-   LOCAL n := OrdNumber()
-   IF n < dbOrderInfo( DBOI_ORDERCOUNT )
+   LOCAL n := OrdNumber(), nMax := dbOrderInfo( DBOI_ORDERCOUNT )
+   IF n < nMax
       OrdSetFocus( n + 1 )
    ELSE
-      OrdSetFocus( 1 )
+      OrdSetFocus( 0 )
    ENDIF
    CoreStatus()
 RETURN NIL
 
+/* the same ring backwards: 1 -> natural -> nMax -> ... */
 FUNCTION BpIdxPrevOrder()
-   LOCAL n := OrdNumber()
+   LOCAL n := OrdNumber(), nMax := dbOrderInfo( DBOI_ORDERCOUNT )
    IF n > 1
       OrdSetFocus( n - 1 )
+   ELSEIF n == 1
+      OrdSetFocus( 0 )
    ELSE
-      OrdSetFocus( dbOrderInfo( DBOI_ORDERCOUNT ) )
+      OrdSetFocus( nMax )
    ENDIF
    CoreStatus()
 RETURN NIL
@@ -3592,15 +3623,17 @@ RETURN NIL
  *  F3 - Index -> "Create Index File"
  * ---------------------------------------------------------------------
  *  Form MEASURED on the original (_reversing/capturas/
- *  oA-createform-06-op7.png): box rows 3..21 / columns 13..68, yellow title
+ *  oA-createform-06-op7.png): box rows 3..21 / columns 13..68 of the original (here 72 WIDE, see IC_W: the file name box holds a real Windows name), yellow title
  *  centered in row 5 ("Create Index / Tag for <FILE>.DBF"),
  *  separators in rows 10, 15 and 18 and these labels/fields:
  *
  *    row  7  Path: (15)                       [C:\] (green, 21..33)
- *              Index File Name: (36)           [CLIENTES.CDX] (red, 53..64)
+ *              Index File Name: (36)           [CLIENTES.CDX] (red, 53..83)
  *    row  8  Multi-Order Bag (Y/N): (15) [Y] (39)
  *              Tag Name: (43)                  [CLIENTES] (red, 53..62)
  *    row  9  Non-Compact IDX (Y/N): (15)  [N] (39)
+ *  The two boxes above are NOT painted (and the ring skips them) on a
+ *  single-order .NTX database, whose file name opens with .NTX instead of .CDX.
  *    row 11  Key Expression: (15)             [(CLI_NUMERO)] (red, 31..64)
  *    row 12  FOR Condition: (16)              [ ] (red, 31..64)
  *    row 14  Unique (Y/N): (17) [N] (31)   Descending (Y/N): (39) [N] (57)
@@ -3668,7 +3701,11 @@ RETURN lFound
  * value through ICF_R()/ICF_C(), offsets from the centred box. BpIdxCreateGeo()
  * is the single source of that origin. */
 #define IC_H            19
-#define IC_W            56
+/* 72 instead of the 56 of the original: the "Index File Name" box has to hold a
+ * real Windows file name (the original's 8.3 fit in 12 cells, a name with 30
+ * characters does not). Everything else is written as an offset from the box,
+ * so the wider frame only adds room to the right. */
+#define IC_W            72
 
 STATIC FUNCTION BpIdxCreateGeo( n )
    LOCAL nT, nL
@@ -3691,9 +3728,15 @@ RETURN 0
 #define ICF_C( __c )   ( IC_L + ( __c ) - 13 )
 #define ICF_SEP_W      ( IC_W - 2 )            /* separators span the inside */
 #define ICF_ROW_HINT   ICF_R( 13 )             /* free frame row for the warning */
+/* width of the "Index File Name" box: up to the frame's inner column, so a real
+ * Windows file name fits (the original's 12 cells were for 8.3 names) */
+#define ICF_FILE_W     ( ( IC_W - 2 ) - ( 53 - 14 ) )
 
-/* full drawing of the form (a single time) */
-STATIC PROCEDURE BpIdxCreateDraw( cFile, cTag, cExpr, cFor )
+/* full drawing of the form (a single time). lCdx tells whether the OPEN database
+ * works with a multi-order .CDX: the two boxes that only mean something for a
+ * .CDX (Multi-Order Bag and Non-Compact IDX) are NOT painted for a single-order
+ * .NTX/.IDX, so the form cannot offer CDX options on an NTX database. */
+STATIC PROCEDURE BpIdxCreateDraw( cFile, cTag, cExpr, cFor, lCdx )
    LOCAL cTit := "Create Index / Tag for " + Upper( CoreFileBase() ) + ".DBF", nCol
    UiPaintBegin()
    UiShadow( IC_T, IC_L, IC_B, IC_R )
@@ -3711,11 +3754,20 @@ STATIC PROCEDURE BpIdxCreateDraw( cFile, cTag, cExpr, cFor )
    UiWrite( ICF_R( 7 ), ICF_C( 15 ), "Path:", UI_C_DLG )
    UiWrite( ICF_R( 7 ), ICF_C( 21 ), PadR( Upper( CoreDir() ), 13 ), UI_C_DLGFIELD )
    UiWrite( ICF_R( 7 ), ICF_C( 36 ), "Index File Name:", UI_C_DLG )
-   UiWrite( ICF_R( 8 ), ICF_C( 15 ), "Multi-Order Bag (Y/N):", UI_C_DLG )
-   UiWrite( ICF_R( 8 ), ICF_C( 39 ), "Y", UI_C_DLGRED )
+   IF lCdx
+      UiWrite( ICF_R( 8 ), ICF_C( 15 ), "Multi-Order Bag (Y/N):", UI_C_DLG )
+      UiWrite( ICF_R( 8 ), ICF_C( 39 ), "Y", UI_C_DLGRED )
+      UiWrite( ICF_R( 9 ), ICF_C( 15 ), "Non-Compact IDX (Y/N):", UI_C_DLG )
+      UiWrite( ICF_R( 9 ), ICF_C( 39 ), "N", UI_C_DLGRED )
+   ELSE
+      /* a single-order .NTX has neither a multi-order bag nor a compact flag:
+       * the two boxes are left blank instead of lying with "Y"/"N" */
+      UiWrite( ICF_R( 8 ), ICF_C( 15 ), Space( 24 ), UI_C_DLG )
+      UiWrite( ICF_R( 8 ), ICF_C( 39 ), " ", UI_C_DLGRED )
+      UiWrite( ICF_R( 9 ), ICF_C( 15 ), Space( 24 ), UI_C_DLG )
+      UiWrite( ICF_R( 9 ), ICF_C( 39 ), " ", UI_C_DLGRED )
+   ENDIF
    UiWrite( ICF_R( 8 ), ICF_C( 43 ), "Tag Name:", UI_C_DLG )
-   UiWrite( ICF_R( 9 ), ICF_C( 15 ), "Non-Compact IDX (Y/N):", UI_C_DLG )
-   UiWrite( ICF_R( 9 ), ICF_C( 39 ), "N", UI_C_DLGRED )
    UiWrite( ICF_R( 11 ), ICF_C( 15 ), "Key Expression:", UI_C_DLG )
    UiWrite( ICF_R( 12 ), ICF_C( 16 ), "FOR Condition:", UI_C_DLG )
    UiWrite( ICF_R( 14 ), ICF_C( 17 ), "Unique (Y/N):", UI_C_DLG )
@@ -3731,7 +3783,7 @@ STATIC PROCEDURE BpIdxCreateDraw( cFile, cTag, cExpr, cFor )
    UiWrite( ICF_R( 20 ), ICF_C( 15 ), "Create Sub-Index of Current Index (Y/N):", UI_C_DLG )
    UiWrite( ICF_R( 20 ), ICF_C( 57 ), "N", UI_C_DLGRED )
    /* initial values of the editable fields */
-   UiWrite( ICF_R( 7 ),  ICF_C( 53 ), PadR( cFile, 12 ), UI_C_DLGRED )
+   UiWrite( ICF_R( 7 ),  ICF_C( 53 ), PadR( cFile, ICF_FILE_W ), UI_C_DLGRED )
    UiWrite( ICF_R( 8 ),  ICF_C( 53 ), PadR( cTag, 10 ), UI_C_DLGRED )
    UiWrite( ICF_R( 11 ), ICF_C( 31 ), PadR( cExpr, 34 ), UI_C_DLGRED )
    UiWrite( ICF_R( 12 ), ICF_C( 31 ), PadR( cFor, 34 ), UI_C_DLGRED )
@@ -3769,7 +3821,7 @@ RETURN NIL
 /* geometry of each box (row, column, width), in the order they are seen */
 STATIC FUNCTION BpIdxCreateSlots()
 RETURN { { ICF_R(  7 ), ICF_C( 21 ), 13 }, ;   /*  1 Path             (informative)   */
-         { ICF_R(  7 ), ICF_C( 53 ), 12 }, ;   /*  2 Index File Name  (text)          */
+         { ICF_R(  7 ), ICF_C( 53 ), ICF_FILE_W }, ;   /*  2 Index File Name  (text)          */
          { ICF_R(  8 ), ICF_C( 39 ),  1 }, ;   /*  3 Multi-Order Bag  (Y/N, fixes Y)  */
          { ICF_R(  8 ), ICF_C( 53 ), 10 }, ;   /*  4 Tag Name         (text)          */
          { ICF_R(  9 ), ICF_C( 39 ),  1 }, ;   /*  5 Non-Compact IDX  (Y/N, fixes N)  */
@@ -3786,6 +3838,18 @@ RETURN { { ICF_R(  7 ), ICF_C( 21 ), 13 }, ;   /*  1 Path             (informati
 STATIC FUNCTION BpIdxCreateHint( nFld )
    DO CASE
    CASE nFld == ICF_PATH  ; RETURN "Path is the database folder (fixed here)."
+   CASE nFld == ICF_FILE
+      /* the F6 "Database Driver" only chooses the RDD of the databases opened
+       * from then on: an area that is already open keeps its engine, and this
+       * form has to say so instead of looking broken */
+      IF Upper( CoreDriver() ) == "DBFNTX" .AND. BpIdxBagExt() == ".CDX"
+         RETURN "This database is open as DBFCDX: close and reopen it to use DBFNTX."
+      ENDIF
+      IF Upper( CoreDriver() ) == "DBFCDX" .AND. BpIdxBagExt() != ".CDX"
+         RETURN "This database works with " + BpIdxBagExt() + ;
+                " files: close and reopen it to use DBFCDX."
+      ENDIF
+      RETURN ""
    CASE nFld == ICF_MOB   ; RETURN "This port always creates a multi-order .CDX."
    CASE nFld == ICF_NC    ; RETURN "Only compact .CDX files are available here."
    CASE nFld == ICF_SCOPE ; RETURN "Scope of a new index is always ALL."
@@ -3794,6 +3858,43 @@ STATIC FUNCTION BpIdxCreateHint( nFld )
    CASE nFld == ICF_SUB   ; RETURN "Sub-indexes are not available in this port."
    ENDCASE
 RETURN ""
+
+/* extension of the index file the OPEN AREA really writes (".CDX" for the
+ * multi-order bag, ".NTX" for the classic single-order file, whatever the RDD
+ * answers). It is read from the AREA and not from the global driver because the
+ * F6 "Database Driver" only chooses the RDD of the databases opened from then
+ * on: an already-open database keeps its engine. */
+STATIC FUNCTION BpIdxBagExt()
+   LOCAL c := ""
+   BEGIN SEQUENCE WITH {| e | Break( e ) }
+      c := dbOrderInfo( DBOI_BAGEXT )
+   RECOVER
+      c := ""
+   END SEQUENCE
+   c := Upper( AllTrim( iif( ValType( c ) == "C", c, "" ) ) )
+   IF Empty( c )
+      c := iif( Upper( CoreDriver() ) == "DBFNTX", ".NTX", ".CDX" )
+   ENDIF
+RETURN c
+
+/* name of the index file NEXT TO the database (a bare name handed to
+ * OrdCreate() would be created in the folder hwBro was started from) */
+STATIC FUNCTION BpIdxBagPath( cName )
+   LOCAL cFile := CoreFileName(), nSep := Rat( "\", cFile )
+RETURN iif( nSep > 0, Left( cFile, nSep ), "" ) + cName
+
+/* next / previous box of the form: the two boxes that only exist for a
+ * multi-order .CDX (Multi-Order Bag and Non-Compact IDX) are SKIPPED on a
+ * single-order .NTX/.IDX, so the ring never lands on a CDX option there */
+STATIC FUNCTION BpIdxStep( nFld, nDir, lCdx )
+   nFld += nDir
+   DO WHILE nFld >= ICF_PATH .AND. nFld <= ICF_NF
+      IF lCdx .OR. ( nFld != ICF_MOB .AND. nFld != ICF_NC )
+         EXIT
+      ENDIF
+      nFld += nDir
+   ENDDO
+RETURN nFld
 
 /* repaints ONE box (value with or without focus) and the warning line, all in a
  * single paint block: a single REFRESH, no flicker */
@@ -3939,12 +4040,17 @@ FUNCTION BpIdxCreate( cFileIn, cTagIn, cExprIn, cForIn, lUniIn, lDescIn )
    LOCAL nT := IC_T, nL := IC_L, nB := IC_B, nR := IC_R
    LOCAL aSlots, aR, nFld, lDone := .F., lUni := .F., lDesc := .F., cVal
    LOCAL cOldCur, nTot := 0, aDef, nIdx
+   LOCAL cExt, lCdx, cBag := ""
    LOCAL lModify := ! Empty( cTagIn )
    IF ! BpNeedDb() ; RETURN NIL ; ENDIF
    IF ! BpIdxNeedExclusive( "Create Index File" )
       RETURN NIL
    ENDIF
-   cFile := Upper( CoreFileBase() ) + ".CDX"
+   /* the file this database really writes: .CDX when it is a multi-order bag,
+    * .NTX for the classic single-order driver (read from the OPEN AREA) */
+   cExt := BpIdxBagExt()
+   lCdx := ( cExt == ".CDX" )
+   cFile := Upper( CoreFileBase() ) + cExt
    cTag  := Upper( CoreFileBase() )
    cExpr := CoreKeyExpr()
    IF ! Empty( cExpr )
@@ -3962,11 +4068,11 @@ FUNCTION BpIdxCreate( cFileIn, cTagIn, cExprIn, cForIn, lUniIn, lDescIn )
    ENDIF
    cOpen := ""
    IF ! Empty( CoreKeyExpr() )
-      cOpen := Upper( hb_FNameName( BpTagBagFile( BpTagCur() ) ) ) + ".CDX"
+      cOpen := Upper( hb_FNameNameExt( BpTagBagFile( BpTagCur() ) ) )
    ENDIF
    cSave := SaveScreen( nT - 1, nL - 1, Min( MaxRow(), nB + 2 ), ;
                         Min( MaxCol(), nR + 2 ) )
-   BpIdxCreateDraw( cFile, cTag, cExpr, cFor )
+   BpIdxCreateDraw( cFile, cTag, cExpr, cFor, lCdx )
    BpLog( "BpIdxCreate: formulario file=" + cFile + " tag=" + cTag + " expr=" + cExpr )
    /* ---- navigable form (13 boxes, in the order they are seen):
     * Enter/Tab/down arrow = next, Shift-Tab/up arrow = previous,
@@ -4042,7 +4148,7 @@ FUNCTION BpIdxCreate( cFileIn, cTagIn, cExprIn, cForIn, lUniIn, lDescIn )
       IF aR[ 2 ] == 3
          lDone := .T.
       ELSE
-         nFld += aR[ 2 ]
+         nFld := BpIdxStep( nFld, aR[ 2 ], lCdx )
          IF nFld > ICF_NF
             lDone := .T.
          ELSEIF nFld < ICF_PATH
@@ -4051,9 +4157,16 @@ FUNCTION BpIdxCreate( cFileIn, cTagIn, cExprIn, cForIn, lUniIn, lDescIn )
       ENDIF
    ENDDO
    SetCursor( cOldCur )
+   /* an EMPTY key expression used to reach OrdCreate() with &( "{|| }" ) and
+    * come back as a bare "Syntax error": it is refused here, with a message
+    */
+   IF lOk .AND. Empty( AllTrim( cExpr ) )
+      lOk  := .F.
+      cErr := "The key expression cannot be empty."
+   ENDIF
    IF lOk
-      /* the index file is always a .CDX (DBFCDX driver) */
-      cFile := Upper( hb_FNameName( cFile ) ) + ".CDX"
+      /* the file of THIS database's engine: .CDX or .NTX, never the other one */
+      cFile := Upper( hb_FNameName( cFile ) ) + cExt
       /* confirmations with the literals of the dump */
       IF BpIdxTagExists( cTag )
          IF ! UiConfirm( "Tag exists already, Overwrite?", "Create Index File" )
@@ -4062,7 +4175,8 @@ FUNCTION BpIdxCreate( cFileIn, cTagIn, cExprIn, cForIn, lUniIn, lDescIn )
       ENDIF
    ENDIF
    IF lOk
-      IF hb_FNameExists( cFile ) .AND. ! ( cOpen == cFile )
+      cBag := BpIdxBagPath( cFile )
+      IF hb_FNameExists( cBag ) .AND. ! ( cOpen == cFile )
          IF ! UiConfirm( "File exists already, Overwrite?", "Create Index File" )
             lOk := .F.
          ENDIF
@@ -4125,7 +4239,7 @@ FUNCTION BpIdxCreate( cFileIn, cTagIn, cExprIn, cForIn, lUniIn, lDescIn )
          ELSE
             OrdCondSet( cFor, &( "{|| " + cFor + " }" ) )
          ENDIF
-         OrdCreate( Upper( hb_FNameName( cFile ) ), cTag, cExpr, ;
+         OrdCreate( cBag, cTag, cExpr, ;
                     &( "{|| " + cExpr + " }" ), lUni )
          IF lDesc
             dbOrderInfo( DBOI_ISDESC, , dbOrderInfo( DBOI_ORDERCOUNT ), .T. )
@@ -5957,7 +6071,7 @@ RETURN iif( ValType( x ) == "C", x, "" )
  * carries the engine's reason); nRecs is the number of accepted records. */
 STATIC FUNCTION LpWalkCore( nScope, nCount, bFor, bWhile, bEach, cProg, cErr, nRecs )
    LOCAL nWalk := 0, nSave := RecNo(), xRes, lDel := Set( _SET_DELETED )
-   LOCAL lCancel := .F., oErr, nRes := 0, nNow
+   LOCAL lCancel := .F., oErr, nRes := 0, nTot, nStep, nSeen := 0, nProgTot
    DEFAULT nCount TO 1
    cErr  := NIL
    nRecs := 0
@@ -5970,7 +6084,26 @@ STATIC FUNCTION LpWalkCore( nScope, nCount, bFor, bWhile, bEach, cProg, cErr, nR
       ELSEIF nScope == LP_SC_ALL
          dbGoTop()
       ENDIF
-      UiProgBegin( cProg, Max( 1, LastRec() ), .T. )
+      nTot := Max( 1, LastRec() )
+      /* one sync before walking: the record buffer reflects the record the loop
+       * starts on (it used to be a dbSkip( 0 ) on EVERY record, which was one of
+       * the costs that made the walks crawl) */
+      dbSkip( 0 )
+      /* the bar counts the records the walk has VISITED, never RecNo(): with an
+       * index the physical record numbers jump all over the file and the counter
+       * went from one number to another (reported by the user). RECORD n is one
+       * record, NEXT n is n records and the rest is the whole table. */
+      nProgTot := nTot
+      DO CASE
+      CASE nScope == LP_SC_REC
+         nProgTot := 1
+      CASE nScope == LP_SC_NEXT
+         nProgTot := Min( Max( 1, nCount ), nTot )
+      ENDCASE
+      /* SPEED: the bar is only touched (and the keyboard polled) every nStep
+       * records - 50,000 records give a step of 100 - not on every record */
+      nStep := UiProgStep( nProgTot )
+      UiProgBegin( cProg, nProgTot, .T. )
       DO WHILE ! Eof()
          IF nScope == LP_SC_NEXT
             nWalk++
@@ -5978,12 +6111,12 @@ STATIC FUNCTION LpWalkCore( nScope, nCount, bFor, bWhile, bEach, cProg, cErr, nR
                EXIT
             ENDIF
          ENDIF
-         dbSkip( 0 )
-         nNow := RecNo()
-         IF UiProgUpdate( Max( 1, nNow ), Max( 1, LastRec() ), ;
-                          "Record " + LTrim( Str( nNow ) ) )
-            lCancel := .T.
-            EXIT
+         nSeen++
+         IF nSeen % nStep == 0
+            IF UiProgUpdate( nSeen, nProgTot )
+               lCancel := .T.
+               EXIT
+            ENDIF
          ENDIF
          IF ! hb_IsNIL( bWhile )
             xRes := Eval( bWhile )
@@ -6011,6 +6144,10 @@ STATIC FUNCTION LpWalkCore( nScope, nCount, bFor, bWhile, bEach, cProg, cErr, nR
             EXIT
          ENDIF
       ENDDO
+      /* the last partial step: the bar ends full (one extra repaint, nothing) */
+      IF ! lCancel
+         UiProgUpdate( nProgTot, nProgTot )
+      ENDIF
       UiProgEnd()
    RECOVER USING oErr
       UiProgEnd()
@@ -7391,7 +7528,7 @@ RETURN aRecs
 STATIC FUNCTION RpApply( aG, aSt )
    LOCAL cField := aSt[ RPX_FLD ], cType := aSt[ RPX_TYPE ]
    LOCAL xVal, cErr, aRecs, nFld, i, nDone := 0, oErr, lCancel := .F., bWith
-   LOCAL nLen := aSt[ RPX_LEN ], nDec := aSt[ RPX_DEC ]
+   LOCAL nLen := aSt[ RPX_LEN ], nDec := aSt[ RPX_DEC ], nTot, nStep
    DEFAULT aG TO NIL
    /* L3: the WITH is an EXPRESSION. It is COMPILED first, and the result of its
     * first evaluation has to be of the type of the destination: both things
@@ -7432,13 +7569,17 @@ STATIC FUNCTION RpApply( aG, aSt )
       RETURN .F.
    ENDIF
    cErr := NIL
-   UiProgBegin( "Replacing " + cField, Len( aRecs ), .T. )
+   nTot := Len( aRecs )
+   nStep := UiProgStep( nTot )
+   UiProgBegin( "Replacing " + cField, nTot, .T. )
    BEGIN SEQUENCE WITH {| e | Break( e ) }
-      FOR i := 1 TO Len( aRecs )
-         IF UiProgUpdate( i, Len( aRecs ), "Replacing " + LTrim( Str( i ) ) + ;
-                          "/" + LTrim( Str( Len( aRecs ) ) ) )
-            lCancel := .T.
-            EXIT
+      FOR i := 1 TO nTot
+         /* SPEED: the bar and the keyboard are touched every nStep records */
+         IF i % nStep == 0 .OR. i == nTot
+            IF UiProgUpdate( i, nTot )
+               lCancel := .T.
+               EXIT
+            ENDIF
          ENDIF
          dbGoto( aRecs[ i ] )
          /* the expression is evaluated ON EVERY RECORD (that is what lets
@@ -8866,12 +9007,16 @@ RETURN nPos
  * commit that fails cannot reach BpFatal() (trap 57). It answers .F. to STOP the
  * walk (cancelled or failed) */
 STATIC FUNCTION ApWriteRec( aMap, nTgt, nSrc, aCtx )
-   LOCAL i, xVal, oErr, lOk := .T.
+   LOCAL i, xVal, oErr, lOk := .T., nStep, nNow
    IF ! hb_IsNIL( aCtx[ 3 ] )
       RETURN .F.
    ENDIF
-   IF UiProgUpdate( aCtx[ 1 ] + 1, aCtx[ 4 ], "Appending " + ;
-                    LTrim( Str( aCtx[ 1 ] + 1 ) ) + "/" + LTrim( Str( aCtx[ 4 ] ) ) )
+   /* SPEED: the bar and the keyboard are touched every nStep records, not on
+    * every one (50,000 records give a step of 100) */
+   nNow  := aCtx[ 1 ] + 1
+   nStep := UiProgStep( aCtx[ 4 ] )
+   IF ( nNow % nStep == 0 .OR. nNow == aCtx[ 4 ] ) .AND. ;
+      UiProgUpdate( nNow, aCtx[ 4 ] )
       aCtx[ 3 ] := "cancelled"
       RETURN .F.
    ENDIF
