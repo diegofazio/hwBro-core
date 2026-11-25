@@ -142,6 +142,10 @@ PROCEDURE Main( xArg )
     * by bp_hc.prg, which cannot call bp_cfg.prg (the headless bank links it
     * alone), so the work is handed in as a block. */
    HcSetCfgHook( {|| BpCfgSave() } )
+   /* `Commands > Theme Colors...` (S137 of theme-color-overrides.md): the screen
+    * is BpThemeColors() of bp_cmds.prg and bp_hc.prg cannot call it (the headless
+    * bank links bp_hc.prg alone), so it travels as a block, like the one above. */
+   HcSetThemeColorsHook( {|| BpThemeColors() } )
    Set( _SET_SCOREBOARD, .F. )
    /* The CANCEL handler terminates the program on Ctrl+<key>, and on a Spanish
     * keyboard AltGr IS Ctrl+Alt: AltGr+C (and Alt+C on some layouts) closed
@@ -1015,6 +1019,7 @@ RETURN { ;
       { "H~I~de Deleted Recs is " + iif( CoreHideDel(), "ON", "OFF" ), "Alt-D", {|| BpGlobToggleHideDel() } }, ;
       { "~S~oftseek is " + iif( CoreSoftSeek(), "ON", "OFF" ), "Alt-Q", {|| BpGlobToggleSoftSeek() } }, ;
       { "", "", NIL }, ;
+      { "~T~heme Colors...", "", {|| BpThemeColors() } }, ;
       { "Sa~V~e Configuration", "", {|| BpCfgSave() } } ;
    }, ;
    { ;

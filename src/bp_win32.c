@@ -38,8 +38,16 @@
  * DotMouseHook(). El click se sigue consumiendo, como siempre.
  */
 #define _CRT_SECURE_NO_WARNINGS
+/* SHGetKnownFolderPath() is Vista+ and the known folder ids live in
+ * <knownfolders.h>: pin the version so the declaration is visible whatever the
+ * SDK default is. */
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0600
+#endif
 #include <windows.h>
 #include <shellapi.h>
+#include <shlobj.h>
+#include <knownfolders.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -48,6 +56,7 @@
 #pragma comment( lib, "user32.lib" )
 #pragma comment( lib, "shell32.lib" )
 #pragma comment( lib, "advapi32.lib" )
+#pragma comment( lib, "ole32.lib" )
 
 #define BP_GRID_COLS   80
 #define BP_GRID_ROWS   25
@@ -113,6 +122,12 @@ static DWORD    s_dwRDown  = 0;         /* GetTickCount() of the press      */
  * (una captura robada NUNCA puede cancelar un formulario) y lo resetea
  * DOTMOUSEHOOK. W32RMOUSEPLAIN() es un PEEK: leerlo no lo limpia. */
 static HB_BOOL  s_lRPlain  = HB_FALSE;  /* el gesto sigue siendo un click    */
+/* trap 75 (temporary diagnostic, BP_DEBUG): how many times OUR window lost the
+ * capture and how many right presses it took. The hold refused trace prints
+ * them, so "the gesture died by itself" can be told from "someone stole the
+ * capture". */
+static int      s_nCapChg  = 0;
+static int      s_nRPress  = 0;
 
 /* The POINTER cell, with NO button pressed (S6 of hc-ctx-menu-clipboard.md).
  * The gesture above only sees the moves of the right button, and the context
@@ -159,6 +174,12 @@ static HB_BOOL  s_lHardDel   = HB_FALSE;
  * them apart; the hook records which ARROW was pressed with CTRL held.
  * 1 = Ctrl+Left, 2 = Ctrl+Right; read once, then 0. */
 static int      s_nWordKey   = 0;
+/* known-folders.md S4: Ctrl-D opens the `Go to` list of the active panel. In
+ * inkey.ch K_CTRL_D is 4, the SAME code as the RIGHT arrow, so Inkey() alone
+ * cannot tell them apart (trap 37); the hook records the chord and the panel
+ * loop drops the Inkey() copy of the same stroke. 1 = pending; read once, then
+ * 0 (and W32GOTOKEYRESET() throws it away unread). */
+static int      s_nGoToKey   = 0;
 static char     s_cAltLast  = 0;         /* last recorded char, upper case    */
 static DWORD    s_dwAltTick = 0;         /* when it was recorded              */
 
@@ -329,7 +350,20 @@ static LRESULT CALLBACK BpMouseProc( HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM
          BpPointerNote( s_iRRow, s_iRCol );   /* the pointer IS there */
          s_dwRDown = GetTickCount();      /* the real moment of the press */
          s_lRDown = HB_TRUE;
+         /* AGENTS.md trap 75 (reported 2026-11-24: "dejo de funcionar el click
+          * derecho mantenido"): a NEW press starts a NEW gesture, so a release
+          * still PENDING here belongs to the PREVIOUS one - it happened while a
+          * screen that does not read this channel was up (the text viewer, the
+          * editor, a dialog), and nobody consumed it. Letting it through ends
+          * this gesture in the very next poll: the hold never reaches its second
+          * and the context panel never opens (measured: the trace showed
+          * `S38 press` with no `S42 panel open`). It would also fire a bogus
+          * "right click = Esc" (HcRClickState). Clearing it here is exact: a
+          * press always precedes its own release, so any UP seen before this
+          * press cannot be this gesture's. */
+         s_lRUp   = HB_FALSE;
          s_lRStep = HB_TRUE;
+         s_nRPress++;
          s_lRPlain = HB_TRUE;             /* still a plain click (right-click-esc) */
          SetCapture( hWnd );
          return 0;
@@ -370,6 +404,7 @@ static LRESULT CALLBACK BpMouseProc( HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM
       case WM_CAPTURECHANGED:
          /* the capture went elsewhere (another window took it): the gesture is
           * closed here, because its RELEASE will never reach this window */
+         s_nCapChg++;
          s_lLDown = HB_FALSE;
          if( s_lRDown )
          {
@@ -412,6 +447,11 @@ static LRESULT CALLBACK BpMouseProc( HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM
                s_nWordKey = 1;                 /* Ctrl+Left  -> word left  */
             else if( ( GetKeyState( VK_CONTROL ) & 0x8000 ) && vk == VK_RIGHT )
                s_nWordKey = 2;                 /* Ctrl+Right -> word right */
+            /* known-folders.md S4: Ctrl-D. Its Inkey() code is the one of the
+             * RIGHT arrow (4, measured in inkey.ch), so the hook is the source
+             * that can tell them apart. */
+            else if( ( GetKeyState( VK_CONTROL ) & 0x8000 ) && vk == 'D' )
+               s_nGoToKey = 1;                 /* Ctrl+D -> go to folder   */
          }
          break;
 
@@ -785,6 +825,19 @@ HB_FUNC( W32RPRESSMS )
       hb_retni( 0 );
    else
       hb_retni( ( int ) ( GetTickCount() - s_dwRDown ) );
+}
+
+/* trap 75 diagnostic: { nCaptureLost, nRightPress }, as two scalars (an array
+ * from this extension kills the process, trap 34). A gesture that dies with
+ * "capture lost" growing is a gesture somebody stole; one that dies without it
+ * was ended by a release. */
+HB_FUNC( W32RCAPCHG )
+{
+   hb_retni( s_nCapChg );
+}
+HB_FUNC( W32RNPRESS )
+{
+   hb_retni( s_nRPress );
 }
 
 /* Grid used to convert the client pixels of a click into a row and a column.
@@ -1276,6 +1329,78 @@ HB_FUNC( W32WORDKEY )
 HB_FUNC( W32WORDKEYRESET )
 {
    s_nWordKey = 0;
+   hb_retni( 0 );
+}
+
+/* ---------------------------------------------------------------------------
+ * known-folders.md S1: the Windows special folders of the user who runs hwBro
+ * (Desktop, Downloads, Documents, Pictures, Favorites), as absolute paths.
+ *
+ *   W32KnowFolder( n ) -> "C:\Users\me\Desktop" or "" when it cannot be asked
+ *
+ * 1..5 in the order of the labels of HcKnownFolderLabels() of bp_hc.prg. It is
+ * SHGetKnownFolderPath(), not %USERPROFILE%\..., because OneDrive and the user
+ * can REDIRECT those folders and then the environment guess points nowhere.
+ * It answers ONE string per call on purpose: returning arrays from this
+ * extension takes the process down (AGENTS trap 34).
+ * ------------------------------------------------------------------------- */
+HB_FUNC( W32KNOWFOLDER )
+{
+   static const KNOWNFOLDERID * s_aId[ 5 ] =
+   {
+      &FOLDERID_Desktop, &FOLDERID_Downloads, &FOLDERID_Documents,
+      &FOLDERID_Pictures, &FOLDERID_Favorites
+   };
+   int n    = hb_parni( 1 );
+   PWSTR psz = NULL;
+   int nLen;
+
+   if( n < 1 || n > 5 )
+   {
+      hb_retc( "" );
+      return;
+   }
+   if( FAILED( SHGetKnownFolderPath( s_aId[ n - 1 ], 0, NULL, &psz ) ) ||
+       psz == NULL )
+   {
+      hb_retc( "" );
+      return;
+   }
+   nLen = WideCharToMultiByte( CP_ACP, 0, psz, -1, NULL, 0, NULL, NULL );
+   if( nLen < 2 )
+   {
+      CoTaskMemFree( psz );
+      hb_retc( "" );
+      return;
+   }
+   {
+      char * pszOut = ( char * ) hb_xgrab( ( HB_SIZE ) nLen );
+      WideCharToMultiByte( CP_ACP, 0, psz, -1, pszOut, nLen, NULL, NULL );
+      hb_retc( pszOut );
+      hb_xfree( pszOut );
+   }
+   CoTaskMemFree( psz );
+}
+
+/* known-folders.md S4: the Ctrl-D channel of the Harbour Commander. The panel
+ * loop asks "is one pending?" and the read CLEARS it, so one stroke is one
+ * action; W32GOTOKEYRESET() throws a stale one away. Scalars, never arrays
+ * (AGENTS trap 34). */
+HB_FUNC( W32GOTOKEYSTEP )
+{
+   hb_retni( s_nGoToKey != 0 ? 1 : 0 );
+}
+
+HB_FUNC( W32GOTOKEY )
+{
+   int n = s_nGoToKey;
+   s_nGoToKey = 0;
+   hb_retni( n );
+}
+
+HB_FUNC( W32GOTOKEYRESET )
+{
+   s_nGoToKey = 0;
    hb_retni( 0 );
 }
 

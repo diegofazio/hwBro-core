@@ -4967,6 +4967,811 @@ FUNCTION BpGlobEpoch()
 RETURN NIL
 
 /* =====================================================================
+ *  S137 - F6 > Theme Colors (odd/tasks/theme-color-overrides.md)
+ *
+ *  The user asked for "exceptions to the selected theme": pick one of the colour
+ *  slots the program has (body, cursor, input, header...) and one of the colours
+ *  of the palette, see it applied AT ONCE, and keep only that exception in
+ *  hwbro.ini. So:
+ *
+ *   - the exception is a PAIR "text/background" and it wins over whichever theme
+ *     is active (UiC() of bp_ui.prg). Text offers the 16 letters of the palette;
+ *     the background offers the EIGHT surfaces of a VGA text mode cell - the
+ *     eight base letters, which are the only surfaces the themes define (see
+ *     UiPaletteBg()). A star in a background is still READ (gtwvg paints it) so
+ *     an ini of the previous build keeps working, but the screen does not offer
+ *     it.
+ *   - choosing a colour APPLIES it in the act: the screen is painted with the
+ *     UI_C_* pairs, so it changes as the user picks, and the preview block shows
+ *     the pair on its own.
+ *   - [ Accept ] keeps the exceptions for the SESSION and [ Cancel ] (Esc, the X
+ *     of the window, a plain right click) puts back the snapshot taken on entry.
+ *     Nothing is written to disk here: persistence is Save Configuration (F6, or
+ *     Commander > Commands), which writes the exception lines of hwbro.ini.
+ *
+ *  Layout (120x44): the list of the 89 slots on the left - grouped, with the
+ *  heading of each group and a scroll window -, the detail of the selected
+ *  element on the right (the 16 x 16 MATRIX of the whole colour space, the pair line, the
+ *  preview and the mock), the message row and the key chips at the bottom. No
+ *  literal of the canvas: everything comes from MaxRow()/MaxCol() through
+ *  BpTcGeom().
+ * ===================================================================== */
+
+/* state of the screen: aSt = { nFocus, nRow, nTop, nFg, nBg, cMsg, lErr } */
+#define THX_FOCUS     1
+#define THX_ROW       2
+#define THX_TOP       3
+#define THX_FG        4
+#define THX_BG        5
+#define THX_MSG       6
+#define THX_ERR       7
+
+/* stops of the focus ring, in the VISUAL order */
+#define THF_LIST      1
+#define THF_GRID      2
+#define THF_ACCEPT    3
+#define THF_CANCEL    4
+
+/* geometry: { maxRow, maxCol, rule, msg, key1, key2, first, last, split,
+ *             listL, listR, detL, detR, lbl, theme, now, flag, pal,
+ *             gcol, gink, gtop, ghdr } */
+#define THG_MAXR      1
+#define THG_MAXC      2
+#define THG_RULE      3
+#define THG_MSG       4
+#define THG_KEY1      5
+#define THG_KEY2      6
+#define THG_FIRST     7
+#define THG_LAST      8
+#define THG_SPLIT     9
+#define THG_LISTL    10
+#define THG_LISTR    11
+#define THG_DETL     12
+#define THG_DETR     13
+#define THG_LBL      14
+#define THG_THEME    15
+#define THG_NOW      16
+#define THG_FLAG     17
+#define THG_GCOL     18          /* first column of the matrix              */
+#define THG_GINK     19          /* column of the ink labels of the matrix  */
+#define THG_GTOP     20          /* first row of the matrix                 */
+#define THG_GHDR     21          /* row of the surface headers              */
+
+#define TH_LBLW      40          /* cells of the element name in the list     */
+
+/* The columns are derived, one from the next: the marker+label, then THEME (5),
+ * then NOW (4) and the exception mark, all of them inside the left panel.
+ * The last four are the 16 x 16 MATRIX of the detail panel: a 5-cell row-label
+ * column (the INKS) and one 3-cell column per SURFACE, with a blank cell between
+ * the 8 base ones and the 8 bright ones. */
+STATIC FUNCTION BpTcGeom()
+   LOCAL nMaxR := MaxRow(), nMaxC := MaxCol()
+   LOCAL nRule  := nMaxR - 4
+   LOCAL nSplit := Int( nMaxC / 2 ) + 2
+   LOCAL nListL := 1
+   LOCAL nListR := nSplit - 2
+   LOCAL nDetL  := nSplit + 2
+   LOCAL nLbl   := nListL + 1
+
+RETURN { nMaxR, nMaxC, nRule, nRule + 1, nRule + 2, nRule + 3, ;
+         4, nRule - 1, nSplit, nListL, nListR, nDetL, nMaxC - 2, ;
+         nLbl, nLbl + TH_LBLW + 1, nLbl + TH_LBLW + 7, nLbl + TH_LBLW + 12, ;
+         nDetL + 6, nDetL + 1, 7, 6 }
+
+/* the row the cursor starts on: the first element that already carries an
+ * exception (the screen opens where the work is), then the body of the panel,
+ * then the first element. */
+STATIC FUNCTION BpTcStart( aRows )
+   LOCAL i
+
+   FOR i := 1 TO Len( aRows )
+      IF aRows[ i ][ 1 ] == 2 .AND. UiOvHas( aRows[ i ][ 2 ] )
+         RETURN i
+      ENDIF
+   NEXT
+   FOR i := 1 TO Len( aRows )
+      IF aRows[ i ][ 1 ] == 2 .AND. aRows[ i ][ 2 ] == TC_DARK
+         RETURN i
+      ENDIF
+   NEXT
+
+RETURN UiSlotRowEdge( aRows, .F. )
+
+/* slot of a row of the list, or 0 for the heading of a group */
+STATIC FUNCTION BpTcSlot( aRows, nRow )
+   IF ! HB_ISARRAY( aRows ) .OR. nRow < 1 .OR. nRow > Len( aRows )
+      RETURN 0
+   ENDIF
+   IF aRows[ nRow ][ 1 ] != 2
+      RETURN 0
+   ENDIF
+RETURN aRows[ nRow ][ 2 ]
+
+/* puts the matrix cursor on the pair in force of the selected element, so the
+ * screen always shows where that element stands. A pair outside the palette (it
+ * cannot be one: the bank checks both theme tables) leaves the cursor where it
+ * was instead of moving it to a lie. */
+STATIC PROCEDURE BpTcSync( aSt, aRows )
+   LOCAL nSlot := BpTcSlot( aRows, aSt[ THX_ROW ] )
+   LOCAL aFg, aBg, a, i
+
+   IF nSlot == 0
+      RETURN
+   ENDIF
+   a := UiPairSplit( UiC( nSlot ) )
+   IF Empty( a )
+      RETURN
+   ENDIF
+
+   aFg := UiPaletteFg()
+   aBg := UiPaletteBg()
+
+   aSt[ THX_FG ] := 1
+   FOR i := 1 TO Len( aFg )
+      IF aFg[ i ][ 1 ] == a[ 1 ]
+         aSt[ THX_FG ] := i
+      ENDIF
+   NEXT
+
+   aSt[ THX_BG ] := 1
+   FOR i := 1 TO Len( aBg )
+      IF aBg[ i ][ 1 ] == a[ 2 ]
+         aSt[ THX_BG ] := i
+      ENDIF
+   NEXT
+RETURN
+
+/* next stop of the ring (1 = forward, -1 = back), wrapping at both ends */
+STATIC FUNCTION BpTcFocus( aSt, nDir )
+   aSt[ THX_FOCUS ] += nDir
+   IF aSt[ THX_FOCUS ] > THF_CANCEL
+      aSt[ THX_FOCUS ] := THF_LIST
+   ENDIF
+   IF aSt[ THX_FOCUS ] < THF_LIST
+      aSt[ THX_FOCUS ] := THF_CANCEL
+   ENDIF
+RETURN "paint"
+
+/* <nCount> elements forward/back from <nRow> (one step at a time, so the group
+ * headings are never a stop) */
+STATIC FUNCTION BpTcMove( aRows, nRow, nCount )
+   LOCAL i, n := nRow
+   FOR i := 1 TO Abs( nCount )
+      n := UiSlotRowStep( aRows, n, iif( nCount > 0, 1, -1 ) )
+   NEXT
+RETURN n
+
+/* <n> brought into 1..<nMax> (the wheel of the matrix and the arrows share the
+ * rule: the ends wrap instead of clamping) */
+STATIC FUNCTION BpTcWrap( n, nMax )
+   IF nMax < 1
+      RETURN 1
+   ENDIF
+   DO WHILE n < 1
+      n += nMax
+   ENDDO
+   DO WHILE n > nMax
+      n -= nMax
+   ENDDO
+RETURN n
+
+/* ---------- painting ---------- */
+
+/* a button of the family of the forms: FLAT at rest, brown with the focus, and
+ * the quick letter inside its own label */
+STATIC PROCEDURE BpTcBtn( nRow, nCol, cLabel, lFoc, nId )
+   LOCAL cPair := iif( lFoc, UI_C_BOXSEL, UI_C_FLATBG )
+   LOCAL nW := UiHotLen( cLabel )
+   SetColor( cPair )
+   @ nRow, nCol SAY Space( nW )
+   UiDrawHot( nRow, nCol, cLabel, cPair, iif( lFoc, UI_C_HOTSEL, UI_C_HOT ) )
+   HcSyncCtlAdd( nRow, nCol, nW, "TBTN", nId )
+RETURN
+
+/* one <key>=action chip of the footer, registered as the KEY it announces */
+STATIC FUNCTION BpTcChip( nRow, nCol, cKey, cAct )
+   SetColor( UI_C_MENUKEY )
+   @ nRow, nCol SAY "<" + cKey + ">"
+   HcSyncCtlAdd( nRow, nCol, Len( cKey ) + 2, "KEY", cKey )
+   SetColor( UI_C_MENUBAR )
+   @ nRow, nCol + Len( cKey ) + 2 SAY cAct
+RETURN nCol + Len( cKey ) + 2 + Len( cAct ) + 2
+
+/* the whole screen, in ONE paint block */
+STATIC PROCEDURE BpTcDraw( aG, aSt, aRows )
+   LOCAL nFirst := aG[ THG_FIRST ], nLast := aG[ THG_LAST ]
+   LOCAL nMaxC := aG[ THG_MAXC ], nDetL := aG[ THG_DETL ]
+   LOCAL nDetW := aG[ THG_DETR ] - nDetL + 1
+   LOCAL nListW := aG[ THG_LISTR ] - aG[ THG_LISTL ] + 1
+   LOCAL nSlot, nIdx, nRow, nI, nJ, nR, aR, cTh, aFg, aBg, cPair, a, cMsg
+   LOCAL nCol
+
+   HcSyncCtlReset()
+   UiPaintBegin()
+
+   UiCls()
+
+   /* row 0: the name of the screen and the theme in force */
+   SetColor( UI_C_CHIP )
+   @ 0, 1 SAY " Theme Colors "
+   cTh := " Theme: " + UiThemeName() + " "
+   @ 0, nMaxC - Len( cTh ) + 1 SAY cTh
+
+   /* row 1: what an exception is, and row 2: the rule */
+   SetColor( UI_C_DESKTOP )
+   @ 1, 1 SAY "Exceptions win over the active theme; they follow it and stay when it changes."
+   @ 2, 0 SAY Replicate( BP_LINE_SINGLE, nMaxC + 1 )
+
+   /* the header of the list, on the band of every table of this program */
+   SetColor( UI_C_HDR )
+   @ 3, aG[ THG_LISTL ] SAY PadR( "  ELEMENT", nListW )
+   @ 3, aG[ THG_THEME ] SAY "THEME"
+   @ 3, aG[ THG_NOW ]   SAY "NOW "
+   @ 3, aG[ THG_FLAG ]  SAY " "
+   @ 3, nDetL SAY PadR( " SELECTED ELEMENT", nDetW )
+
+   /* ---- the list, scrolled so the cursor is always visible ---- */
+   IF aSt[ THX_ROW ] < aSt[ THX_TOP ]
+      aSt[ THX_TOP ] := aSt[ THX_ROW ]
+   ENDIF
+   IF aSt[ THX_ROW ] > aSt[ THX_TOP ] + ( nLast - nFirst )
+      aSt[ THX_TOP ] := aSt[ THX_ROW ] - ( nLast - nFirst )
+   ENDIF
+   IF aSt[ THX_TOP ] < 1
+      aSt[ THX_TOP ] := 1
+   ENDIF
+
+   FOR nI := 0 TO nLast - nFirst
+      nRow := nFirst + nI
+      nIdx := aSt[ THX_TOP ] + nI
+      SetColor( UI_C_DESKTOP )
+      @ nRow, aG[ THG_LISTL ] SAY Space( nListW )
+      IF nIdx >= 1 .AND. nIdx <= Len( aRows )
+         aR := aRows[ nIdx ]
+         IF aR[ 1 ] == 1
+            /* the heading of a group: a rule with its name, in the pair of the
+             * screen (no band: a group is a separator, not a control) */
+            SetColor( UI_C_DESKTOP )
+            @ nRow, aG[ THG_LISTL ] SAY PadR( " " + UiSlotGroupName( aR[ 2 ] ) + " ", ;
+                                             nListW, BP_LINE_SINGLE )
+         ELSE
+            nSlot := aR[ 2 ]
+            IF nIdx == aSt[ THX_ROW ]
+               SetColor( UI_C_LISTSEL )
+               @ nRow, aG[ THG_LISTL ] SAY Space( nListW )
+            ENDIF
+            /* the label: the cursor row is marked with "> ". Left() because PadR()
+             * does NOT cut a string that is already longer (AGENTS trap: a label
+             * that outgrows its column would push the pairs out of the row) */
+            SetColor( iif( nIdx == aSt[ THX_ROW ], UI_C_LISTSEL, UI_C_DESKTOP ) )
+            @ nRow, aG[ THG_LBL ] SAY PadR( Left( iif( nIdx == aSt[ THX_ROW ], "> ", "  " ) + ;
+                                           UiSlotLabel( nSlot ), TH_LBLW ), TH_LBLW )
+            @ nRow, aG[ THG_THEME ] SAY PadR( UiThemePair( nSlot ), 5 )
+            @ nRow, aG[ THG_NOW ]   SAY PadR( UiC( nSlot ), 4 )
+            IF UiOvHas( nSlot )
+               @ nRow, aG[ THG_FLAG ] SAY "*"
+            ENDIF
+         ENDIF
+      ENDIF
+   NEXT
+
+   /* ---- the detail of the selected element ---- */
+   nSlot := BpTcSlot( aRows, aSt[ THX_ROW ] )
+   SetColor( UI_C_DESKTOP )
+   @ 4, nDetL SAY PadR( Left( UiSlotLabel( nSlot ), nDetW ), nDetW )
+   @ 5, nDetL SAY Replicate( BP_LINE_SINGLE, nDetW )
+
+   /* ---- the detail of the selected element: the 16 x 16 MATRIX ---- */
+   /* header: the 16 SURFACES as columns, each one printed with a readable ink
+    * over its own colour (its swatch pair), so `N` and `N*` are told apart at a
+    * glance; the blank cell before the ninth column separates the 8 base
+    * surfaces from the 8 bright ones */
+   aBg := UiPaletteBg()
+   SetColor( UI_C_DESKTOP )
+   @ aG[ THG_GHDR ], aG[ THG_GINK ] SAY PadR( "Fg\Bg", 5 )
+   FOR nI := 1 TO Len( aBg )
+      nCol := aG[ THG_GCOL ] + ( nI - 1 ) * 3 + iif( nI > 8, 1, 0 )
+      SetColor( UiPalSwatchPair( aBg[ nI ][ 1 ] ) )
+      @ aG[ THG_GHDR ], nCol SAY PadC( aBg[ nI ][ 1 ], 3 )
+   NEXT
+
+   /* the matrix: EVERY cell is painted with its own pair, so what is under the
+    * cursor is exactly what the element will look like, and the cells whose ink
+    * and surface are the same read as a solid block (as the 16 x 16 table says). The
+    * row label of the cursor carries the focus band - one focus, one colour -
+    * and the cursor cell is painted with its pair SWAPPED, the language of every
+    * editor of this program, so it is found on top of any colour */
+   aFg := UiPaletteFg()
+   FOR nI := 1 TO Len( aFg )
+      nR := aG[ THG_GTOP ] + nI - 1
+      SetColor( iif( aSt[ THX_FOCUS ] == THF_GRID .AND. aSt[ THX_FG ] == nI, ;
+                     UI_C_LISTSEL, UI_C_DESKTOP ) )
+      @ nR, aG[ THG_GINK ] SAY PadR( aFg[ nI ][ 1 ], 4 )
+      FOR nJ := 1 TO Len( aBg )
+         nCol := aG[ THG_GCOL ] + ( nJ - 1 ) * 3 + iif( nJ > 8, 1, 0 )
+         cPair := aFg[ nI ][ 1 ] + "/" + aBg[ nJ ][ 1 ]
+         SetColor( cPair )
+         @ nR, nCol SAY PadC( aBg[ nJ ][ 1 ], 3 )
+         IF nI == aSt[ THX_FG ] .AND. nJ == aSt[ THX_BG ]
+            SetColor( UiSwapColor( cPair ) )
+            @ nR, nCol SAY PadC( aBg[ nJ ][ 1 ], 3 )
+         ENDIF
+         /* every cell is registered, so a click means THAT combination */
+         HcSyncCtlAdd( nR, nCol, 3, "TCEL", ( nI - 1 ) * 16 + nJ )
+      NEXT
+   NEXT
+
+   /* every rule and every label sets its own pair: the last cell of the matrix
+    * leaves the colour of ITS pair, and a rule painted with it would draw a band
+    * of that colour across the panel (measured with the old strips) */
+   nR := aG[ THG_GTOP ] + Len( aFg )
+   SetColor( UI_C_DESKTOP )
+   @ nR, nDetL SAY Replicate( BP_LINE_SINGLE, nDetW )
+
+   /* the pair in force and the one of the theme, in one line */
+   a := UiPairSplit( UiC( nSlot ) )
+   cPair := iif( Empty( a ), UiC( nSlot ), a[ 1 ] + "/" + a[ 2 ] )
+   @ nR + 1, nDetL SAY PadR( " Pair: " + cPair + "   Theme: " + UiThemePair( nSlot ) + ;
+                            iif( UiOvHas( nSlot ), "  *", "" ), nDetW )
+
+   @ nR + 2, nDetL SAY Replicate( BP_LINE_SINGLE, nDetW )
+
+   /* the preview: the selected pair applied to text and to a block of cells */
+   @ nR + 3, nDetL SAY PadR( " Preview", nDetW )
+   SetColor( cPair )
+   @ nR + 4, nDetL SAY PadR( " Aa Bb Cc 0123    ", nDetW )
+   @ nR + 5, nDetL SAY Space( nDetW )
+
+   SetColor( UI_C_DESKTOP )
+   @ nR + 6, nDetL SAY Replicate( BP_LINE_SINGLE, nDetW )
+
+   /* a small mock of the screens the elements belong to, each row with the pairs
+    * it really uses: changing the menu bar, a record or an input is seen here at
+    * once even when that element is not the selected one */
+   SetColor( UI_C_MENUBAR )
+   @ nR + 8, nDetL SAY PadR( "  Menu bar ", 22 )
+   SetColor( UI_C_MENULBL )
+   @ nR + 8, nDetL + 22 SAY " Label "
+   SetColor( UI_C_MENUKEY )
+   @ nR + 8, nDetL + 30 SAY " F1 "
+
+   SetColor( UI_C_HDR )
+   @ nR + 9, nDetL SAY PadR( "  Column header ", 22 )
+   SetColor( UI_C_REC )
+   @ nR + 9, nDetL + 22 SAY PadR( " record ", 14 )
+   SetColor( UI_C_RECSEL )
+   @ nR + 9, nDetL + 36 SAY " curr "
+   SetColor( UI_C_CURSEL )
+   @ nR + 9, nDetL + 42 SAY " cell "
+
+   SetColor( UI_C_FIELDBG )
+   @ nR + 10, nDetL SAY PadR( "  Input field ", 22 )
+   SetColor( UI_C_ERR )
+   @ nR + 10, nDetL + 22 SAY PadR( " error ", 14 )
+   SetColor( UI_C_CHIP )
+   @ nR + 10, nDetL + 36 SAY PadR( " chip ", 12 )
+
+   SetColor( UI_C_DESKTOP )
+   @ nR + 11, nDetL SAY Replicate( BP_LINE_SINGLE, nDetW )
+
+   /* the whole contract of the screen, in the room the mock leaves free */
+   @ nR + 13, nDetL SAY PadR( "Session only: Accept keeps them for this run.", nDetW )
+   @ nR + 14, nDetL SAY PadR( "Save Configuration (F6) writes hwbro.ini.", nDetW )
+   @ nR + 15, nDetL SAY PadR( "Reset (Alt-R) returns one to the theme.", nDetW )
+
+   /* ---- the message row, and the two buttons at its right ---- */
+   cMsg := aSt[ THX_MSG ]
+   IF Empty( cMsg )
+      cMsg := iif( UiOvCount() == 0, "No exception: every element follows the theme.", ;
+                  LTrim( Str( UiOvCount() ) ) + " exception(s) in this session." )
+   ENDIF
+   SetColor( iif( aSt[ THX_ERR ], UI_C_ERR, UI_C_HDR ) )
+   @ aG[ THG_MSG ], 0 SAY PadR( " " + Left( cMsg, nMaxC - 30 ), nMaxC - 27 )
+   BpTcBtn( aG[ THG_MSG ], nMaxC - 25, "[ ~A~ccept ]", aSt[ THX_FOCUS ] == THF_ACCEPT, THF_ACCEPT )
+   BpTcBtn( aG[ THG_MSG ], nMaxC - 12, "[ ~C~ancel ]", aSt[ THX_FOCUS ] == THF_CANCEL, THF_CANCEL )
+
+   /* ---- the key chips ---- */
+   SetColor( UI_C_MENUBAR )
+   @ aG[ THG_KEY1 ], 0 SAY Space( nMaxC + 1 )
+   @ aG[ THG_KEY2 ], 0 SAY Space( nMaxC + 1 )
+   nCol := 1
+   nCol := BpTcChip( aG[ THG_KEY1 ], nCol, "Enter", "Apply" )
+   nCol := BpTcChip( aG[ THG_KEY1 ], nCol, "Tab", "Ring" )
+   nCol := BpTcChip( aG[ THG_KEY1 ], nCol, "Alt-T", "Matrix" )
+   nCol := BpTcChip( aG[ THG_KEY1 ], nCol, "Alt-R", "Reset" )
+   nCol := BpTcChip( aG[ THG_KEY1 ], nCol, "Alt-L", "Reset all" )
+   nCol := BpTcChip( aG[ THG_KEY1 ], nCol, "Ctrl-S", "Accept" )
+   nCol := BpTcChip( aG[ THG_KEY1 ], nCol, "Esc", "Cancel" )
+
+   nCol := 1
+   nCol := BpTcChip( aG[ THG_KEY2 ], nCol, "F1", "Help" )
+   SetColor( UI_C_MENUBAR )
+   @ aG[ THG_KEY2 ], nCol SAY "Up/Down Inks  Left/Right Surfaces  Home/End   Wheel Rows   Click Pick"
+
+   SetColor( UI_C_DESKTOP )
+   UiPaintEnd()
+RETURN
+
+/* ---------- the actions ---------- */
+
+/* pins the pair UNDER THE MATRIX CURSOR (ink + surface) on the selected element */
+STATIC PROCEDURE BpTcApply( aSt, aRows )
+   LOCAL nSlot := BpTcSlot( aRows, aSt[ THX_ROW ] )
+   LOCAL cFg, cBg, cPair
+
+   IF nSlot == 0
+      RETURN
+   ENDIF
+
+   cFg := UiPaletteFg()[ aSt[ THX_FG ] ][ 1 ]
+   cBg := UiPaletteBg()[ aSt[ THX_BG ] ][ 1 ]
+   cPair := UiPairMake( cFg, cBg )
+
+   IF Empty( cPair )
+      aSt[ THX_MSG ] := "That pair cannot be painted: " + cFg + "/" + cBg
+      aSt[ THX_ERR ] := .T.
+      RETURN
+   ENDIF
+   IF UiOvSet( nSlot, cPair )
+      aSt[ THX_MSG ] := "Exception: " + UiSlotLabel( nSlot ) + " = " + cPair
+      aSt[ THX_ERR ] := .F.
+   ELSE
+      aSt[ THX_MSG ] := "That pair cannot be painted: " + cPair
+      aSt[ THX_ERR ] := .T.
+   ENDIF
+RETURN
+
+/* goes back to the pair of the theme in force */
+STATIC PROCEDURE BpTcReset( aSt, aRows )
+   LOCAL nSlot := BpTcSlot( aRows, aSt[ THX_ROW ] )
+   IF nSlot == 0
+      RETURN
+   ENDIF
+   IF ! UiOvHas( nSlot )
+      aSt[ THX_MSG ] := "That element has no exception."
+      aSt[ THX_ERR ] := .T.
+      RETURN
+   ENDIF
+   UiOvClear( nSlot )
+   aSt[ THX_MSG ] := UiSlotLabel( nSlot ) + " follows the theme again."
+   aSt[ THX_ERR ] := .F.
+   BpTcSync( aSt, aRows )
+RETURN
+
+STATIC PROCEDURE BpTcResetAll( aSt, aRows )
+   LOCAL n := UiOvCount()
+   IF n == 0
+      aSt[ THX_MSG ] := "There is no exception to reset."
+      aSt[ THX_ERR ] := .T.
+      RETURN
+   ENDIF
+   IF UiConfirm( "Reset " + LTrim( Str( n ) ) + " exception(s) and let every element" + ;
+                 hb_eol() + "follow the theme in force?", "Theme Colors" )
+      UiOvClearAll()
+      aSt[ THX_MSG ] := "Every element follows the theme again."
+      aSt[ THX_ERR ] := .F.
+      BpTcSync( aSt, aRows )
+   ENDIF
+RETURN
+
+STATIC PROCEDURE BpTcHelp()
+   UiTextWin( { ;
+      "Theme Colors - keys", ;
+      "", ;
+      "  Up / Down     move the cursor through the elements", ;
+      "  PgUp / PgDn   a page of elements;  Home / End  the first / last", ;
+      "  Tab / S-Tab   list -> colour matrix -> buttons", ;
+      "  Arrows        in the matrix: Up/Down the ink, Left/Right the surface", ;
+      "  Home / End    first / last surface of the row", ;
+      "  Ctrl-Home/End first ink + first surface / last ink + last surface", ;
+      "  Enter         apply the pair under the cursor (also Space, or a click)", ;
+      "  Alt-T         go to the colour matrix", ;
+      "  Alt-R         Reset: the element follows the theme again", ;
+      "  Alt-L         Reset all the exceptions (asks first)", ;
+      "  Ctrl-S        Accept (same as the Accept button)", ;
+      "  Esc           Cancel: puts back what there was when the screen opened", ;
+      "  F1            this help", ;
+      "", ;
+      "The matrix is the whole colour space of the driver: 16 inks (rows) by", ;
+      "16 surfaces (columns) = 256 attributes, and every cell is painted with", ;
+      "its own pair. '+' brightens the ink and '*' the surface, and the two bits", ;
+      "are position-free, so N+/B and N/B+ are the same pair. An exception wins", ;
+      "over the theme in force; it is kept for the SESSION only - use Save", ;
+      "Configuration (F6 > GlobalSet, or Commander > Commands) to write hwbro.ini." }, ;
+      "Theme Colors - keys" )
+RETURN
+
+/* The rule of the keys. It MUTATES the state (the cursor and the focus) and
+ * answers the action to run, exactly like the other forms of this program:
+ * "" = nothing, "paint" = state only. */
+STATIC FUNCTION BpTcKeyAct( aG, aSt, aRows, nKey, nShift, cAlt )
+   LOCAL lCtrl := hb_bitAnd( nShift, HB_GTI_KBD_CTRL ) != 0
+   LOCAL lAlt  := hb_bitAnd( nShift, HB_GTI_KBD_ALT ) != 0
+   LOCAL nPage := aG[ THG_LAST ] - aG[ THG_FIRST ] + 1
+   LOCAL nFg, nBg
+
+   /* 1) the Alt chords: the ring of the hook first (trap 61), then the bare
+    * letter plus the ALT bit of the driver (trap 37). ALT together with CTRL is
+    * AltGr, which types a character and is not a chord (trap 38). */
+   IF Empty( cAlt ) .AND. lAlt .AND. ! lCtrl .AND. nKey >= 32 .AND. nKey <= 255
+      cAlt := Upper( Chr( nKey ) )
+   ENDIF
+   IF Len( cAlt ) > 0
+      DO CASE
+      CASE cAlt == "A" ; RETURN "accept"
+      CASE cAlt == "C" ; RETURN "cancel"
+      CASE cAlt == "R" ; RETURN "reset"
+      CASE cAlt == "L" ; RETURN "resetall"
+      CASE cAlt == "T" ; aSt[ THX_FOCUS ] := THF_GRID ; RETURN "paint"
+      ENDCASE
+      /* a chord nobody serves is DROPPED: it must not act later */
+      RETURN "none"
+   ENDIF
+
+   DO CASE
+   CASE nKey == K_ESC
+      RETURN "cancel"
+   CASE nKey == K_F1
+      RETURN "help"
+   /* Ctrl-S = Accept. This driver hands it over as the code of K_LEFT (19) WITH
+    * the CTRL bit (trap 71), so the code alone is not the rule */
+   CASE lCtrl .AND. ! lAlt .AND. ( nKey == K_CTRL_S .OR. nKey == Asc( "s" ) .OR. ;
+                                   nKey == Asc( "S" ) )
+      RETURN "accept"
+   CASE nKey == K_TAB .OR. nKey == K_SH_TAB
+      RETURN BpTcFocus( aSt, iif( nKey == K_TAB, 1, -1 ) )
+   ENDCASE
+
+   DO CASE
+   CASE aSt[ THX_FOCUS ] == THF_LIST
+      DO CASE
+      CASE nKey == K_UP
+         aSt[ THX_ROW ] := UiSlotRowStep( aRows, aSt[ THX_ROW ], -1 )
+         BpTcSync( aSt, aRows )
+         RETURN "paint"
+      CASE nKey == K_DOWN
+         aSt[ THX_ROW ] := UiSlotRowStep( aRows, aSt[ THX_ROW ], 1 )
+         BpTcSync( aSt, aRows )
+         RETURN "paint"
+      CASE nKey == K_PGUP
+         aSt[ THX_ROW ] := BpTcMove( aRows, aSt[ THX_ROW ], -nPage )
+         BpTcSync( aSt, aRows )
+         RETURN "paint"
+      CASE nKey == K_PGDN
+         aSt[ THX_ROW ] := BpTcMove( aRows, aSt[ THX_ROW ], nPage )
+         BpTcSync( aSt, aRows )
+         RETURN "paint"
+      CASE nKey == K_HOME
+         aSt[ THX_ROW ] := UiSlotRowEdge( aRows, .F. )
+         BpTcSync( aSt, aRows )
+         RETURN "paint"
+      CASE nKey == K_END
+         aSt[ THX_ROW ] := UiSlotRowEdge( aRows, .T. )
+         BpTcSync( aSt, aRows )
+         RETURN "paint"
+      CASE nKey == K_ENTER .OR. nKey == K_SPACE .OR. nKey == K_INS
+         /* Enter on an element walks to its pair in the matrix, like opening a
+          * field: the cursor lands on the combination that element uses now */
+         BpTcSync( aSt, aRows )
+         aSt[ THX_FOCUS ] := THF_GRID
+         RETURN "paint"
+      ENDCASE
+
+   CASE aSt[ THX_FOCUS ] == THF_GRID
+      /* the two axes of the matrix: Up/Down walks the 16 INKS, Left/Right the 16
+       * SURFACES. The ends are what the palette answers, never a literal, so the
+       * ring follows a palette that grows. Enter APPLIES the combination under
+       * the cursor (also Space, and a click, which is the same action) */
+      nFg := Len( UiPaletteFg() )
+      nBg := Len( UiPaletteBg() )
+      DO CASE
+      CASE nKey == K_UP
+         aSt[ THX_FG ] := iif( aSt[ THX_FG ] <= 1, nFg, aSt[ THX_FG ] - 1 )
+         RETURN "paint"
+      CASE nKey == K_DOWN
+         aSt[ THX_FG ] := iif( aSt[ THX_FG ] >= nFg, 1, aSt[ THX_FG ] + 1 )
+         RETURN "paint"
+      CASE nKey == K_LEFT
+         aSt[ THX_BG ] := iif( aSt[ THX_BG ] <= 1, nBg, aSt[ THX_BG ] - 1 )
+         RETURN "paint"
+      CASE nKey == K_RIGHT
+         aSt[ THX_BG ] := iif( aSt[ THX_BG ] >= nBg, 1, aSt[ THX_BG ] + 1 )
+         RETURN "paint"
+      CASE nKey == K_HOME
+         aSt[ THX_BG ] := 1
+         RETURN "paint"
+      CASE nKey == K_END
+         aSt[ THX_BG ] := nBg
+         RETURN "paint"
+      CASE nKey == K_CTRL_HOME
+         aSt[ THX_FG ] := 1
+         aSt[ THX_BG ] := 1
+         RETURN "paint"
+      CASE nKey == K_CTRL_END
+         aSt[ THX_FG ] := nFg
+         aSt[ THX_BG ] := nBg
+         RETURN "paint"
+      CASE nKey == K_ENTER .OR. nKey == K_SPACE
+         RETURN "pair"
+      ENDCASE
+
+   CASE aSt[ THX_FOCUS ] == THF_ACCEPT
+      IF nKey == K_ENTER .OR. nKey == K_SPACE
+         RETURN "accept"
+      ENDIF
+
+   CASE aSt[ THX_FOCUS ] == THF_CANCEL
+      IF nKey == K_ENTER .OR. nKey == K_SPACE
+         RETURN "cancel"
+      ENDIF
+   ENDCASE
+
+RETURN ""
+
+/* one click, resolved against the controls the painter registered: the same
+ * actions the keyboard runs, never a second implementation (the control table is
+ * the ONLY copy of the geometry). */
+STATIC FUNCTION BpTcClick( aG, aSt, aRows, nRow, nCol )
+   LOCAL aC, nIdx, cNm
+
+   /* a row of the list: the cursor goes there (a heading is not a stop) */
+   IF nRow >= aG[ THG_FIRST ] .AND. nRow <= aG[ THG_LAST ] .AND. ;
+      nCol >= aG[ THG_LISTL ] .AND. nCol <= aG[ THG_LISTR ]
+      nIdx := aSt[ THX_TOP ] + ( nRow - aG[ THG_FIRST ] )
+      IF nIdx >= 1 .AND. nIdx <= Len( aRows ) .AND. aRows[ nIdx ][ 1 ] == 2
+         IF aSt[ THX_ROW ] != nIdx
+            aSt[ THX_ROW ] := nIdx
+            aSt[ THX_FOCUS ] := THF_LIST
+            BpTcSync( aSt, aRows )
+            RETURN "paint"
+         ENDIF
+      ENDIF
+      RETURN "none"
+   ENDIF
+
+   aC := HcSyncCtlAt( nRow, nCol )
+   IF hb_IsNIL( aC )
+      RETURN "none"
+   ENDIF
+
+   DO CASE
+   CASE aC[ 4 ] == "TBTN"
+      aSt[ THX_FOCUS ] := aC[ 5 ]
+      RETURN iif( aC[ 5 ] == THF_ACCEPT, "accept", "cancel" )
+   CASE aC[ 4 ] == "TCEL"
+      /* a matrix cell: the cursor goes there AND the combination is applied -
+       * one gesture, like the swatch of the old strips */
+      aSt[ THX_FOCUS ] := THF_GRID
+      aSt[ THX_FG ] := Int( ( aC[ 5 ] - 1 ) / 16 ) + 1
+      aSt[ THX_BG ] := ( ( aC[ 5 ] - 1 ) % 16 ) + 1
+      RETURN "pair"
+   CASE aC[ 4 ] == "KEY"
+      cNm := aC[ 5 ]
+      IF cNm == "Ctrl-S"
+         RETURN "accept"
+      ENDIF
+      IF Left( cNm, 4 ) == "Alt-" .AND. Len( cNm ) == 5
+         RETURN BpTcKeyAct( aG, aSt, aRows, 0, 0, Upper( SubStr( cNm, 5, 1 ) ) )
+      ENDIF
+      aC := HcSyncChipInput( cNm )
+      RETURN BpTcKeyAct( aG, aSt, aRows, aC[ 1 ], 0, "" )
+   ENDCASE
+
+RETURN "none"
+
+/* F6 > Theme Colors */
+FUNCTION BpThemeColors()
+   LOCAL aG, aSt, aRows, aSave, aPt
+   LOCAL lPaint := .T., lDone := .F., lHook := .F.
+   LOCAL nKey, nShift, cAlt, cAct, cOldCur, nNotch
+
+   aG    := BpTcGeom()
+   aRows := UiSlotRows()
+   aSt   := { THF_LIST, 1, 1, 1, 1, "", .F. }
+   aSt[ THX_ROW ] := BpTcStart( aRows )
+   BpTcSync( aSt, aRows )
+   aSave := UiOvSnapshot()
+
+   cOldCur := SetCursor( 0 )
+   /* the window hook is what gives this driver a mouse and the Alt chords of the
+    * ring; it is asked (not assumed) and re-tried while it answers that it is not
+    * in place (trap 89: arming it before the window exists leaves it unarmed) */
+   lHook := DotMouseHookOn()
+   IF ! lHook
+      DotMouseHook( .T. )
+      lHook := DotMouseHookOn()
+   ENDIF
+   /* a chord left pending by another screen is not a gesture of this one */
+   cAlt := HcAltChord()
+   cAlt := UiAltChord()
+
+   DO WHILE ! lDone
+      /* trap 89: the hook is armed for real only when the window exists, so a
+       * screen entered before the first paint re-tries until it answers that it is
+       * in place. Without it there is no mouse and no Alt chord of the ring. */
+      IF ! lHook
+         lHook := DotMouseHookOn()
+         IF ! lHook
+            DotMouseHook( .T. )
+            lHook := DotMouseHookOn()
+         ENDIF
+      ENDIF
+      IF lPaint
+         BpTcDraw( aG, aSt, aRows )
+         lPaint := .F.
+      ENDIF
+      cAct := ""
+      nKey   := Inkey( 0.05 )
+      nShift := iif( nKey != 0, HcShiftState(), 0 )
+      cAlt   := HcAltChord()
+      IF Len( cAlt ) == 0
+         cAlt := UiAltChord()
+      ENDIF
+      IF UiCloseAsk()
+         cAct := "cancel"
+      ENDIF
+      IF Empty( cAct ) .AND. HcMouseRightClick()
+         cAct := "cancel"
+      ENDIF
+      IF Empty( cAct )
+         IF nKey == 0 .AND. Len( cAlt ) == 0
+            aPt := UiClick()
+            IF HB_ISARRAY( aPt )
+               cAct := BpTcClick( aG, aSt, aRows, aPt[ 1 ], aPt[ 2 ] )
+            ELSE
+               nNotch := UiMouseWheel()
+               IF nNotch != 0
+                  DO CASE
+                  CASE aSt[ THX_FOCUS ] == THF_LIST
+                     aSt[ THX_ROW ] := BpTcMove( aRows, aSt[ THX_ROW ], -nNotch )
+                     BpTcSync( aSt, aRows )
+                     cAct := "paint"
+                  CASE aSt[ THX_FOCUS ] == THF_GRID
+                     /* one notch = one row of INKS, the same way Up/Down walks */
+                     aSt[ THX_FG ] := BpTcWrap( aSt[ THX_FG ] - nNotch, ;
+                                                Len( UiPaletteFg() ) )
+                     cAct := "paint"
+                  ENDCASE
+               ENDIF
+            ENDIF
+         ELSE
+            cAct := BpTcKeyAct( aG, aSt, aRows, nKey, nShift, cAlt )
+         ENDIF
+      ENDIF
+      IF Empty( cAct ) .OR. cAct == "none"
+         LOOP
+      ENDIF
+      DO CASE
+      CASE cAct == "cancel"
+         /* Cancel puts back exactly what the store had when the screen opened:
+          * the changes were applied live, so this is the only way back */
+         UiOvRestore( aSave )
+         lDone := .T.
+      CASE cAct == "accept"
+         lDone := .T.
+      CASE cAct == "pair"
+         BpTcApply( aSt, aRows )
+         lPaint := .T.
+      CASE cAct == "reset"
+         BpTcReset( aSt, aRows )
+         lPaint := .T.
+      CASE cAct == "resetall"
+         BpTcResetAll( aSt, aRows )
+         lPaint := .T.
+      CASE cAct == "help"
+         BpTcHelp()
+         lPaint := .T.
+      CASE cAct == "paint"
+         lPaint := .T.
+      ENDCASE
+   ENDDO
+
+   SetCursor( cOldCur )
+   SetColor( UI_C_DESKTOP )
+RETURN NIL
+
+
+/* =====================================================================
  *  F7 - Record
  * ===================================================================== */
 

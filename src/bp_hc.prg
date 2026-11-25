@@ -410,6 +410,10 @@ STATIC s_lHcRClickArmed := .F.
  * when the row it landed on carries no entry; a press on the title, the header
  * or the rule of the panel still opens nothing. */
 STATIC s_lHcDragBody := .F.
+/* trap 75: the tick of the gesture whose refused hold has ALREADY been traced,
+ * so the one-line-per-gesture trace does not flood the log (it is read only by
+ * BP_DEBUG builds and by verifica-ctx-real.ps1). */
+STATIC s_nHcHoldLog := 0
 /* S6 of odd/tasks/commander-cleanup.md: the LITTLE BAR that tells the user that
  * the held right button is about to open its menu. It appears after
  * HC_CTX_BARFROM seconds and fills until the hold completes, so the gesture has
@@ -440,8 +444,19 @@ STATIC s_bHcConfirm := NIL
  * here because this module is also linked by the headless bank, which has no
  * bp_cfg.prg. With no hook the row says it is not available. */
 STATIC s_bHcCfgSave := NIL
+/* `Commands > Theme Colors...` (S137 of theme-color-overrides.md): the screen
+ * itself is BpThemeColors() of bp_cmds.prg and this module is linked without it
+ * by the headless bank, so hwbro.prg hands the block in here - the same bridge
+ * as the Save configuration hook below. */
+STATIC s_bHcThemeColors := NIL
 /* progress of the file operations: bytes done / total and the <Esc> flag */
 STATIC s_nHcProgDone := 0
+/* what the counter of the progress box counts: "bytes" for a copy / move / paste
+ * / link transfer, "entries" for the attribute walk. UiProgText() of bp_ui.prg
+ * hard-codes "records", which made a file copy read "65536 / 262144 records" -
+ * the user looked at that and reported "parece que copia registro por registro"
+ * although HcCopyOneFile() is a plain 64 KB byte copy (2026-11-24). */
+STATIC s_cHcProgUnit := "bytes"
 STATIC s_nHcProgTotal := 0
 STATIC s_lHcProgEsc := .F.
 /* optional cancellation hook of the headless bank: {| nDone | lCancel }, in the
@@ -987,6 +1002,24 @@ FUNCTION BpHcScreen()
          nKey := 0
       ENDIF
 
+      /* known-folders.md S4, FOURTH channel: Ctrl-D opens the `Go to` list of
+       * the ACTIVE panel. MEASURED (inkey.ch + trap 37): its Inkey() code is 4,
+       * the SAME as the RIGHT arrow, so the window hook is the one that tells
+       * them apart and the Inkey() copy of the same stroke is dropped here
+       * (nKey := 0) or it would move the caret of the command line. An open
+       * incremental search closes first, like with any key that is not a
+       * letter. */
+      IF HcGoToDrain() != 0
+         IF lFind
+            HcFindClose()
+            lFind := .F.
+            lStatus := .T.
+         ENDIF
+         HcGoToPick( HcActive() )
+         lFull := .T.
+         nKey := 0
+      ENDIF
+
       /* S1/S2 of recycle-bin-delete.md, THIRD channel: Shift+Del. MEASURED
        * (traps 37/58/61): this driver delivers the combo with no modifier of
        * its own - it used to arrive as the clipboard code 4 and the panels
@@ -1433,6 +1466,16 @@ FUNCTION BpHcScreen()
 
       CASE nKey == K_ALT_F2
          IF HcPickDrive( HC_PANEL_R )
+            lFull := .T.
+         ENDIF
+
+      /* known-folders.md S4: Ctrl-D. The window hook records the chord (see the
+       * HcGoToDrain() branch above) and zeroes the key; this is the FALLBACK for
+       * a session without the hook. Ctrl-D and the RIGHT arrow share the code 4
+       * in inkey.ch, so only the CTRL bit separates them: without it this CASE
+       * does not match and the plain Right of the command line runs below. */
+      CASE nKey == K_CTRL_D .AND. lCtrl
+         IF HcGoToPick( HcActive() )
             lFull := .T.
          ENDIF
 
@@ -3445,7 +3488,8 @@ RETURN .T.
  * THE PEER (S15: the DRIVES verb) and choosing one NAVIGATES the remote panel; it
  * never unlinks (S14: leaving the link is `Left`/`Right > Disconnect link`). */
 STATIC FUNCTION HcPickDrive( nId )
-   LOCAL aP := HcPanel( nId ), aDrv, n, cErr := ""
+   LOCAL aP := HcPanel( nId ), aDrv, aFold, aPick, aPath := {}, n, cErr := ""
+   LOCAL i
    IF HcLinkPanel( aP )
       aDrv := HcLinkRemoteDrives( @cErr )
       IF ! HB_ISARRAY( aDrv )
@@ -3467,25 +3511,216 @@ STATIC FUNCTION HcPickDrive( nId )
       HcLoad( aP )
       RETURN .T.
    ENDIF
-   aDrv := HcDrives()
-   IF Empty( aDrv )
+   /* S3 of known-folders.md: the LOCAL panel lists the drives and, after them,
+    * the Windows folders of the user. Both are plain rows of the same UiPick;
+    * the index decides whether a drive root or an absolute folder was chosen.
+    * The folders are local paths, so the LINKED branch above does not see them
+    * (its panel walks the peer's tree). */
+   aDrv  := HcDrives()
+   aFold := HcKnownFolderLive( HcKnownFolderPaths() )
+   IF Empty( aDrv ) .AND. Empty( aFold )
       RETURN .F.
    ENDIF
-   n := UiPick( aDrv, iif( nId == HC_PANEL_L, "Choose left drive", ;
-                                             "Choose right drive" ), 1 )
-   IF n < 1 .OR. n > Len( aDrv )
+   aPick := {}
+   FOR i := 1 TO Len( aDrv )
+      AAdd( aPick, aDrv[ i ] )
+   NEXT
+   FOR i := 1 TO Len( aFold )
+      AAdd( aPick, aFold[ i ][ 1 ] )
+      AAdd( aPath, aFold[ i ][ 2 ] )
+   NEXT
+   n := UiPick( aPick, iif( nId == HC_PANEL_L, "Choose left drive or folder", ;
+                                               "Choose right drive or folder" ), 1 )
+   IF n < 1 .OR. n > Len( aPick )
       RETURN .F.
    ENDIF
-   aP[ HC_P_DIR ] := aDrv[ n ] + "\"
-   aP[ HC_P_SEL ] := 1
-   HcLoad( aP )
-RETURN .T.
+   IF n <= Len( aDrv )
+      aP[ HC_P_DIR ] := aDrv[ n ] + "\"
+      aP[ HC_P_SEL ] := 1
+      aP[ HC_P_TOP ] := 1
+      HcLoad( aP )
+      RETURN .T.
+   ENDIF
+RETURN HcGoFolder( nId, aPath[ n - Len( aDrv ) ] )
 
 /* the drives of this machine: ONE implementation in bp_link.prg (LinkDrives()),
  * shared with the DRIVES verb of the Slave, through the bridge of the module so
  * the headless build still links (HcLkDrives) */
 STATIC FUNCTION HcDrives()
 RETURN HcLkDrives()
+
+/* =====================================================================
+ *  known-folders.md: the Windows folders of the user
+ *
+ *  Desktop, Downloads, Documents, Pictures and Favorites, reachable from
+ *  `Left`/`Right > Go to`, from Ctrl-D and, after the drives, from the
+ *  Alt-F1/Alt-F2 picker. The paths come from SHGetKnownFolderPath() through
+ *  the native helper (they can be REDIRECTED to OneDrive or moved by the
+ *  user, so %USERPROFILE%\... is only the fallback of the headless build).
+ * ===================================================================== */
+
+/* the five labels, in the order of the native helper. Pure. */
+FUNCTION HcKnownFolderLabels()
+RETURN { "Desktop", "Downloads", "Documents", "Pictures", "Favorites" }
+
+/* the same labels with their hot letter marked (~X~): D / O / M / P / F, one
+ * each, never repeated inside the cascade. Pure. */
+FUNCTION HcKnownFolderHot()
+RETURN { "~D~esktop", "D~o~wnloads", "Docu~m~ents", "~P~ictures", "~F~avorites" }
+
+/* S1: the five rows as { { cLabel, cPath }, ... }, ALWAYS five and in the same
+ * order as the labels. <aPaths> is the list of paths in that order and a
+ * missing/empty one stays as "": that is a folder this machine does not have,
+ * and the caller dims the row instead of opening it. Pure (no disk). */
+FUNCTION HcKnownFolderRows( aPaths )
+   LOCAL aLbl := HcKnownFolderLabels(), a := {}, i, c
+   FOR i := 1 TO Len( aLbl )
+      c := ""
+      IF HB_ISARRAY( aPaths ) .AND. i <= Len( aPaths ) .AND. ;
+         ValType( aPaths[ i ] ) == "C"
+         c := aPaths[ i ]
+      ENDIF
+      AAdd( a, { aLbl[ i ], c } )
+   NEXT
+RETURN a
+
+/* only the rows whose folder EXISTS on this machine, in menu order. */
+FUNCTION HcKnownFolderLive( aPaths )
+   LOCAL aAll := HcKnownFolderRows( aPaths ), a := {}, i
+   FOR i := 1 TO Len( aAll )
+      IF ! Empty( aAll[ i ][ 2 ] ) .AND. hb_DirExists( aAll[ i ][ 2 ] )
+         AAdd( a, aAll[ i ] )
+      ENDIF
+   NEXT
+RETURN a
+
+/* S1: the paths behind the labels: the native helper and, when it answers
+ * nothing (the headless bank does not link bp_win32.c, or Windows refused),
+ * %USERPROFILE%\<label>. No disk is touched here: HcKnownFolderLive() is the
+ * one that decides what exists. */
+FUNCTION HcKnownFolderPaths()
+   LOCAL aLbl := HcKnownFolderLabels(), a := {}, i
+   LOCAL cHome := hb_GetEnv( "USERPROFILE" )
+   IF ValType( cHome ) != "C"
+      cHome := ""
+   ENDIF
+   IF ! Empty( cHome ) .AND. ! ( Right( cHome, 1 ) == "\" )
+      cHome += "\"
+   ENDIF
+   FOR i := 1 TO Len( aLbl )
+      AAdd( a, HcKnownFolderNative( i ) )
+      IF Empty( a[ i ] ) .AND. ! Empty( cHome )
+         a[ i ] := cHome + aLbl[ i ]
+      ENDIF
+   NEXT
+RETURN a
+
+/* the native side, or "" when this build has no window/OS helper */
+STATIC FUNCTION HcKnownFolderNative( n )
+   LOCAL c := ""
+#ifndef BP_HC_STANDALONE
+   c := W32KnowFolder( n )
+   IF ValType( c ) != "C"
+      c := ""
+   ENDIF
+#endif
+RETURN c
+
+/* S2: `Go to` lands a panel on one of those folders. It is a LOCAL directory,
+ * so a linked panel is refused (its HC_P_DIR belongs to the peer); a panel that
+ * is a TREE goes back to the plain listing and one inside an archive leaves the
+ * archive first, exactly like choosing a drive with Alt-F1/F2. */
+FUNCTION HcGoFolder( nId, cPath )
+   LOCAL aP := HcPanel( nId ), nZip
+   IF ! HB_ISARRAY( aP ) .OR. ValType( cPath ) != "C" .OR. Empty( cPath )
+      RETURN .F.
+   ENDIF
+   IF HcLinkPanel( aP )
+      UiErr( "Commander Link: the remote panel is read-only, that action is not available.", ;
+             BP_APPNAME )
+      RETURN .F.
+   ENDIF
+   IF ! hb_DirExists( cPath )
+      RETURN .F.
+   ENDIF
+   nZip := HcZipPanelOf( aP )
+   IF ValType( nZip ) == "N" .AND. nZip > 0
+      HcZipLeave( nZip )
+   ENDIF
+   IF HcPanelTree( aP )
+      aP[ HC_P_TREE ]  := .F.
+      aP[ HC_P_NODES ] := {}
+      aP[ HC_P_TSEL ]  := 1
+      aP[ HC_P_TTOP ]  := 1
+   ENDIF
+   aP[ HC_P_DIR ] := HcDirArg( cPath )
+   aP[ HC_P_SEL ] := 1
+   aP[ HC_P_TOP ] := 1
+   HcSetActive( nId )
+   HcLoad( aP )
+RETURN .T.
+
+/* S4: Ctrl-D: the five folders of the ACTIVE panel in their own list. Refused
+ * on a linked panel for the same reason as HcGoFolder(). */
+STATIC FUNCTION HcGoToPick( nId )
+   LOCAL aLive, aLbl := {}, aPath := {}, i, n
+   IF HcLinkPanel( HcPanel( nId ) )
+      UiErr( "Commander Link: the remote panel is read-only, that action is not available.", ;
+             BP_APPNAME )
+      RETURN .F.
+   ENDIF
+   aLive := HcKnownFolderLive( HcKnownFolderPaths() )
+   IF Empty( aLive )
+      UiMsg( "This machine does not have the Windows folders of the user.", "Go to folder" )
+      RETURN .F.
+   ENDIF
+   FOR i := 1 TO Len( aLive )
+      AAdd( aLbl,  aLive[ i ][ 1 ] )
+      AAdd( aPath, aLive[ i ][ 2 ] )
+   NEXT
+   n := UiPick( aLbl, "Go to folder", 1 )
+   IF n < 1 .OR. n > Len( aPath )
+      RETURN .F.
+   ENDIF
+RETURN HcGoFolder( nId, aPath[ n ] )
+
+/* S2: the rows of the `Go to` CASCADE of one panel. Each block carries its own
+ * path (a codeblock cannot read the loop variable: by the time it runs the loop
+ * is over), and a folder this machine does not have is a "D" row. A linked
+ * panel gets no rows at all: its paths would be local. */
+STATIC FUNCTION HcMenuGoTo( nId )
+   LOCAL aRow, aHot := HcKnownFolderHot(), aSub := {}, i
+   IF HcLinkPanel( HcPanel( nId ) )
+      RETURN aSub
+   ENDIF
+   aRow := HcKnownFolderRows( HcKnownFolderPaths() )
+   FOR i := 1 TO Len( aRow )
+      AAdd( aSub, { aHot[ i ], "", HcGoToBlock( nId, aRow[ i ][ 2 ] ), ;
+                    iif( HcGoToOk( aRow[ i ][ 2 ] ), "", "D" ) } )
+   NEXT
+RETURN aSub
+
+/* the action of one cascade row; the parameters are LOCALS of this call, so
+ * every row keeps its own path after the loop of HcMenuGoTo() is over */
+FUNCTION HcGoToBlock( nId, cPath )
+RETURN {|| HcGoFolder( nId, cPath ) }
+
+/* .T. when that row can be run: there is a path and the folder is there */
+FUNCTION HcGoToOk( cPath )
+   IF ValType( cPath ) != "C" .OR. Empty( cPath )
+      RETURN .F.
+   ENDIF
+RETURN hb_DirExists( cPath )
+
+/* S2: the flag of the `Go to` row itself: dimmed on a linked panel and when
+ * this machine has none of the five folders. */
+STATIC FUNCTION HcGoToFlag( nId )
+   LOCAL aLive
+   IF HcLinkPanel( HcPanel( nId ) )
+      RETURN "D"
+   ENDIF
+   aLive := HcKnownFolderLive( HcKnownFolderPaths() )
+RETURN iif( Empty( aLive ), "D", "" )
 
 /* =====================================================================
  *  Painting (S6 colours, S7 geometry, one paint block per refresh)
@@ -4656,6 +4891,27 @@ STATIC FUNCTION HcMouseRightPressMs()
 #endif
 RETURN n
 
+/* trap 75 diagnostic (BP_DEBUG): the counters of bp_win32.c, so a gesture that
+ * died says whether it lost the CAPTURE (somebody stole it) or was ended by a
+ * release. Guarded like every other call into the extension. */
+STATIC FUNCTION BpCapChg()
+   LOCAL n := 0
+#ifndef BP_HC_STANDALONE
+   IF hb_IsFunction( "W32RCAPCHG" )
+      n := W32RCAPCHG()
+   ENDIF
+#endif
+RETURN n
+
+STATIC FUNCTION BpRPress()
+   LOCAL n := 0
+#ifndef BP_HC_STANDALONE
+   IF hb_IsFunction( "W32RNPRESS" )
+      n := W32RNPRESS()
+   ENDIF
+#endif
+RETURN n
+
 /* S38: how long the button has been held, in seconds. It is taken from the
  * message itself when the window hook is there, so the up to 50 ms wait of the
  * poll does not add to the hold; the Seconds() tick is the fallback. */
@@ -5378,10 +5634,25 @@ STATIC FUNCTION HcDragStep()
       s_nHcDragTick := Seconds()      /* S38: from here the hold is counted */
 #ifndef BP_HC_STANDALONE
       BpLog( "S38 press row=" + LTrim( Str( nRow ) ) + " idx=" + ;
-             LTrim( Str( s_nHcDragIdx ) ) + " tick=" + LTrim( Str( s_nHcDragTick ) ) )
+             LTrim( Str( s_nHcDragIdx ) ) + " tick=" + LTrim( Str( s_nHcDragTick ) ) + ;
+             " plain=" + iif( HcCtxRightPlain(), "1", "0" ) + ;
+             " cap=" + LTrim( Str( BpCapChg() ) ) + " rp=" + LTrim( Str( BpRPress() ) ) )
 #endif
       s_lHcDragMv   := .F.
       s_lHcDragMenu := .F.
+      /* AGENTS.md trap 75 (reported 2026-11-24: "dejo de funcionar el click
+       * derecho mantenido"): a release still PENDING in the channel belongs to
+       * the gesture BEFORE this press - it happened while a screen that does not
+       * read it was up, or it is the one bp_win32.c raises when our window LOSES
+       * the capture (a left click on a menu option does exactly that, and it was
+       * measured: two capture changes between two gestures). Reading it in THIS
+       * very pass would end the gesture at once: HcCtxHoldDue() would never see a
+       * live gesture, the panel would never open and the entry would end up
+       * marked as if it had been a plain right click. The release that matters is
+       * the one that comes AFTER this press. */
+      DO WHILE HcMouseRightUp()
+         EXIT
+      ENDDO
       IF nId != HcActive()
          HcSetActive( nId )
          HcDrawScreen()
@@ -5437,6 +5708,11 @@ STATIC FUNCTION HcDragEnd()
    IF ! s_lHcDrag
       RETURN .F.
    ENDIF
+#ifndef BP_HC_STANDALONE
+   BpLog( "S38 dragend el=" + LTrim( Str( HcHoldElapsed() ) ) + ;
+          " moved=" + iif( s_lHcDragMv, "1", "0" ) + " idx=" + LTrim( Str( s_nHcDragIdx ) ) + ;
+          " cap=" + LTrim( Str( BpCapChg() ) ) + " rp=" + LTrim( Str( BpRPress() ) ) )
+#endif
    s_lHcDrag := .F.
    /* S38: a hold that lasted the whole threshold opens the panel even if the
     * poll never ticked (the app was busy, or the release landed in the same
@@ -7380,9 +7656,25 @@ RETURN
  * and, from HC_CTX_BARFROM seconds on, keeps the little bar in step with the
  * hold so the user SEES that the menu is about to open. */
 STATIC FUNCTION HcCtxHoldCheck()
-   IF ! HcCtxHoldDue( HcHoldElapsed(), s_lHcDrag, s_lHcDragMv, ;
-                      s_lHcDragMenu, s_nHcDragIdx, s_lHcDragBody )
+   LOCAL lDue := HcCtxHoldDue( HcHoldElapsed(), s_lHcDrag, s_lHcDragMv, ;
+                               s_lHcDragMenu, s_nHcDragIdx, s_lHcDragBody )
+   IF ! lDue
       HcCtxBarStep()
+#ifndef BP_HC_STANDALONE
+      /* trap 75 (2026-11-24): when the hold has lasted the threshold and the
+       * panel still did not open, say WHICH of the six facts is refusing it. It
+       * is what told apart "the gesture was ended by a stale release" from
+       * "the gesture was never started". */
+      IF HcHoldElapsed() >= HC_CTX_HOLD .AND. s_nHcHoldLog != s_nHcDragTick
+         s_nHcHoldLog := s_nHcDragTick
+         BpLog( "S38 hold refused el=" + LTrim( Str( HcHoldElapsed() ) ) + ;
+                " drag=" + iif( s_lHcDrag, "1", "0" ) + ;
+                " moved=" + iif( s_lHcDragMv, "1", "0" ) + ;
+                " opened=" + iif( s_lHcDragMenu, "1", "0" ) + ;
+                " idx=" + LTrim( Str( s_nHcDragIdx ) ) + ;
+                " body=" + iif( s_lHcDragBody, "1", "0" ) )
+      ENDIF
+#endif
       RETURN .F.
    ENDIF
    HcCtxBarHide()
@@ -7801,7 +8093,10 @@ STATIC PROCEDURE HcHelp()
       "               search and opens/runs the entry under the cursor, Esc", ;
       "               closes it and STAYS on the entry found); ANY other key", ;
       "               closes the search and then acts normally", ;
-      "  Alt-F1/F2    choose the drive of the left / right panel", ;
+      "  Ctrl-D       go to a Windows folder of the user (Desktop, Downloads,", ;
+      "               Documents, Pictures, Favorites) in the active panel", ;
+      "  Alt-F1/F2    choose the drive OR one of those folders of the left /", ;
+      "               right panel", ;
       "  Mouse        the wheel scrolls the active panel, a click on a", ;
       "               row selects it, a click on the header Name/Size/Date", ;
       "               sorts the FILES of that panel by that column (the same", ;
@@ -8119,6 +8414,8 @@ RETURN
 STATIC FUNCTION HcMenuLeft()
 RETURN { ;
    { "~C~hange drive...", "Alt-F1", {|| HcPickDrive( HC_PANEL_L ) },        "" }, ;
+   { "~G~o to",           HcMenuSubMark(), NIL, HcGoToFlag( HC_PANEL_L ),   ;
+     HcMenuGoTo( HC_PANEL_L ) }, ;
    { "~Z~oom panel",      "Ctrl-O", {|| HcToggleZoom() },                  "" }, ;
    { "~T~ree panel",      "",       {|| HcTreeMenu( HC_PANEL_L ) },         ;
      HcTreeMenuFlag( HC_PANEL_L ) }, ;
@@ -8137,6 +8434,8 @@ RETURN { ;
 STATIC FUNCTION HcMenuRight()
 RETURN { ;
    { "~C~hange drive...", "Alt-F2", {|| HcPickDrive( HC_PANEL_R ) },        "" }, ;
+   { "~G~o to",           HcMenuSubMark(), NIL, HcGoToFlag( HC_PANEL_R ),   ;
+     HcMenuGoTo( HC_PANEL_R ) }, ;
    { "~Z~oom panel",      "Ctrl-O", {|| HcToggleZoom() },                  "" }, ;
    { "~T~ree panel",      "",       {|| HcTreeMenu( HC_PANEL_R ) },         ;
      HcTreeMenuFlag( HC_PANEL_R ) }, ;
@@ -8194,6 +8493,13 @@ STATIC FUNCTION HcMenuCmds()
    NEXT
 
    AAdd( aItems, { "~T~hemes", HcMenuSubMark(), NIL, "", aSub } )
+   /* S137 of theme-color-overrides.md: the colour EXCEPTIONS, the same screen the
+    * F6 GlobalSet opens. It runs the hook hwbro.prg installs (the screen lives in
+    * bp_cmds.prg) and raises s_lHcThemePicked so the key loop paints the whole
+    * screen once, exactly like a theme switch: what the user accepted (or
+    * cancelled) has to be seen in the panels when the box closes. The letter is
+    * `O` because `T` is `Themes`, `C` is `Save configuration` and `Q` is `Quit`. */
+   AAdd( aItems, { "Theme C~o~lors...", "", {|| HcThemeColors() }, "" } )
    AAdd( aItems, { "Save ~C~onfiguration", "", {|| HcCfgSave() }, "" } )
    AAdd( aItems, { "~Q~uit", "F10", {|| HcQuit() }, "" } )
 
@@ -17322,6 +17628,26 @@ STATIC FUNCTION HcCfgSave()
    Eval( s_bHcCfgSave )
 RETURN NIL
 
+/* `Commands > Theme Colors...` (S137 of odd/tasks/theme-color-overrides.md): the
+ * colour-exception screen lives in bp_cmds.prg, which this module cannot call
+ * (the headless bank links bp_hc.prg alone), so hwbro.prg hands the block in
+ * here, exactly like the Save configuration hook above. The screen applies the
+ * exceptions LIVE and the dropdown had the panels saved, so after it returns the
+ * whole screen has to be painted again: s_lHcThemePicked is the flag the key
+ * loop already turns into a full repaint (the one a theme switch raises), so
+ * both paths - Accept and Cancel - end with the panels showing the truth. */
+FUNCTION HcSetThemeColorsHook( bBlock )
+   s_bHcThemeColors := bBlock
+RETURN NIL
+
+STATIC FUNCTION HcThemeColors()
+   IF hb_IsNIL( s_bHcThemeColors )
+      RETURN NIL
+   ENDIF
+   Eval( s_bHcThemeColors )
+   s_lHcThemePicked := .T.
+RETURN NIL
+
 /* Overwrite hook of the headless bank (S17): {| cName, cSrc, cDst | nChoice },
  * where the choice is 1..7 as listed by HcOwDecide(). NIL removes it. Across
  * the copy api it is the ONLY way a headless run answers the overwrite dialog:
@@ -17361,14 +17687,32 @@ STATIC FUNCTION HcConfirm( cText, cTitle )
 
 /* ---- progress of the operations (skipped when headless) ---- */
 
-STATIC PROCEDURE HcProgBegin( cTitle, nTotal )
+/* What the counter line counts. A copy, a move, a paste and a link transfer
+ * count BYTES (the chunk they just wrote); the attribute walk counts entries.
+ * UiProgText() of bp_ui.prg hard-codes the word "records", so passing the counts
+ * there made a file copy read "65536 / 262144 records": the user looked at that
+ * box and reported "parece que copia registro por registro" although the engine
+ * is a plain byte copy (2026-11-24). The unit travels here. */
+/* (the unit lives with the other progress STATICs, at the top of this module) */
+STATIC PROCEDURE HcProgBegin( cTitle, nTotal, cUnit )
+   DEFAULT cUnit TO "bytes"
    s_nHcProgDone  := 0
    s_nHcProgTotal := Max( 0, nTotal )
+   s_cHcProgUnit  := cUnit
    s_lHcProgEsc   := .F.
    IF ! HcHeadless()
       UiProgBegin( cTitle, s_nHcProgTotal )
    ENDIF
 RETURN
+
+/* the counter line of the Commander's operations: "12 / 26 bytes  47%" with the
+ * unit of the operation in the middle (it fits the 56 cells of the box) */
+STATIC FUNCTION HcProgLine()
+   LOCAL nPct := iif( s_nHcProgTotal > 0, ;
+                      Min( 100, Int( s_nHcProgDone * 100 / s_nHcProgTotal ) ), 100 )
+RETURN PadL( LTrim( Str( s_nHcProgDone ) ), 12 ) + " / " + ;
+       PadL( LTrim( Str( s_nHcProgTotal ) ), 12 ) + " " + s_cHcProgUnit + ;
+       PadL( LTrim( Str( nPct ) ) + "%", 6 )
 
 /* adds nAdd to the progress; .T. means the operation was cancelled (the
  * injected hook of a test, or <Esc> on the progress bar). NOTE: without a
@@ -17385,7 +17729,7 @@ STATIC FUNCTION HcProgStep( nAdd )
    IF HcHeadless()
       RETURN .F.
    ENDIF
-   s_lHcProgEsc := UiProgUpdate( s_nHcProgDone, s_nHcProgTotal )
+   s_lHcProgEsc := UiProgUpdate( s_nHcProgDone, s_nHcProgTotal, HcProgLine() )
 RETURN s_lHcProgEsc
 
 STATIC PROCEDURE HcProgEnd()
@@ -18405,6 +18749,22 @@ RETURN 0
     * killed hwBro on the first key of the panel) */
    IF W32ClipKeyStep() != 0
       RETURN W32ClipKey()
+   ENDIF
+RETURN 0
+#endif
+
+/* S4 of known-folders.md: the Ctrl-D chord recorded by the window hook
+ * (0 = none, 1 = pending) and taken, which also clears it. In the headless bank
+ * there is no hook, so the answer is always 0. */
+STATIC FUNCTION HcGoToDrain()
+#ifdef BP_HC_STANDALONE
+RETURN 0
+#else
+   /* the "!= 0" is NOT cosmetic: this Harbour raises "Argument error:
+    * conditional" on IF <number>, and the native side returns a number
+    * (trap 59) */
+   IF W32GoToKeyStep() != 0
+      RETURN W32GoToKey()
    ENDIF
 RETURN 0
 #endif
@@ -25745,7 +26105,7 @@ STATIC FUNCTION HcAttrApply( aWalk, aAll, aAny, dDate, cTime )
    LOCAL i, j, nOk := 0, nFail := 0, lCancel := .F., lMulti := ( Len( aWalk ) > 1 )
    LOCAL nAttr, nNew, dNew, cNew, dCur, cCur, lOk, aWant
    IF lMulti
-      HcProgBegin( "Changing attributes", Len( aWalk ) )
+      HcProgBegin( "Changing attributes", Len( aWalk ), "entries" )
    ENDIF
    FOR i := 1 TO Len( aWalk )
       IF lMulti

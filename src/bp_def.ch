@@ -323,7 +323,7 @@
 #define BP_LINE_SINGLE  Chr( 196 )   /* ─ */
 #define BP_LINE_DOUBLE  Chr( 205 )   /* ═ */
 
-#define BP_VERSION      "3.00"
+#define BP_VERSION      "3.2"
 #define BP_APPNAME      "hwBro"
 
 /* ---- code files of the Harbour Commander viewer/editor (S78..S80) ---------

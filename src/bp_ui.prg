@@ -130,6 +130,28 @@ STATIC s_nUiTheme := 1
  * never calls hb_gtInfo() itself (S8). */
 STATIC s_bUiThemePal := NIL
 
+/* ---------- per-slot colour EXCEPTIONS (odd/tasks/theme-color-overrides.md) --
+ * An exception is the pair the user pinned for ONE slot of `bp_def.ch` on top of
+ * whatever theme is active, and it survives a theme switch on purpose: it is a
+ * preference about that element, not part of a theme. The store is indexed by
+ * the TC_* slot and holds "" for every slot the user did not touch, so "only the
+ * exception is saved" (the .ini writes just the non-empty ones) needs no second
+ * bookkeeping.
+ *
+ * s_aUiSlot  { cKey, cLabel, nGroup } per slot, in the order of bp_def.ch:
+ *            cKey is what `hwbro.ini` stores (the TC_* name in lower case), the
+ *            label is what the screen shows and the group is the heading it is
+ *            filed under. Three columns because one table has to serve the
+ *            screen, the file and the integrity check (Len == TC_COUNT).
+ * s_aUiSlotG the name of each group, in the order the screen shows them.
+ * s_aUiPal   the palette the screen offers: { cLetter, cName } x 16, the EIGHT
+ *            first ones being the only ones usable as a BACKGROUND (with
+ *            FONTA_DRAWBOX GTWVG only resolves a base entry as a background). */
+STATIC s_aUiOv := {}
+STATIC s_aUiSlot := {}
+STATIC s_aUiSlotG := {}
+STATIC s_aUiPal := {}
+
 /* ---------- theme engine ---------- */
 
 /* Colour pair of slot <nSlot> of the ACTIVE theme. This is what the UI_C_*
@@ -156,6 +178,14 @@ FUNCTION UiC( nSlot )
    ENDIF
    IF nSlot < 1 .OR. nSlot > Len( aCol )
       RETURN ""
+   ENDIF
+   /* S137: a colour EXCEPTION wins over the theme in force. The store may be
+    * shorter than the table (it starts empty and UiOvSet() never grows it past
+    * TC_COUNT), so the length is checked before indexing. An empty entry means
+    * "this slot follows the theme", which is the state of every slot nobody
+    * touched - and the reason the .ini only writes the exceptions. */
+   IF nSlot <= Len( s_aUiOv ) .AND. ! Empty( s_aUiOv[ nSlot ] )
+      RETURN s_aUiOv[ nSlot ]
    ENDIF
 
 RETURN aCol[ nSlot ]
@@ -254,7 +284,7 @@ FUNCTION UiThemeInit()
       "W/B", ;   // 76  CODECMT
       "R+/B", ;   // 77  CODENUM
       "BG+/B", ;   // 78  CODEFUNC
-      "RG+/B", ;   // 79  CODEPRE
+      "RB+/B", ;   // 79  CODEPRE: bright MAGENTA (not `RG+`, which ColorToN reads as `GR+`)
       "W+/B", ;   // 80  TABLBLON: label and brackets of the ACTIVE tab
       "W/N", ;    // 81  TABLBLOFF: label and brackets of the other tabs
       "N/BG", ;   // 82  TABXACT: the mark at rest on the active tab (own chip)
@@ -386,7 +416,7 @@ FUNCTION UiThemeInit()
       "W/N", ;   // 76  CODECMT
       "R+/N", ;   // 77  CODENUM
       "BG+/N", ;   // 78  CODEFUNC
-      "RG+/N", ;   // 79  CODEPRE
+      "RB+/N", ;   // 79  CODEPRE: bright MAGENTA (not `RG+`, which ColorToN reads as `GR+`)
       "W+/B", ;   // 80  TABLBLON: label and brackets of the ACTIVE tab
       "N+/N", ;   // 81  TABLBLOFF: label and brackets of the other tabs (dim on Dark)
       "N/BG", ;   // 82  TABXACT: the mark at rest on the active tab (own chip)
@@ -627,6 +657,716 @@ FUNCTION UiThemePalette( cName )
    NEXT
 
 RETURN aPal
+
+/* =====================================================================
+ *  COLOUR EXCEPTIONS OVER THE THEME IN FORCE (S137 of
+ *  odd/tasks/theme-color-overrides.md)
+ *
+ *  The user asked to "add exceptions to the selected theme": pick one of the
+ *  colour slots the program has (body, cursor, input, header...) and one of the
+ *  colours of the palette, see it applied at once, and keep just that exception
+ *  in hwbro.ini. Everything below is PURE (no window, no driver, no disk) so the
+ *  headless bank pins it; the screen lives in bp_cmds.prg and the .ini in
+ *  bp_cfg.prg.
+ *
+ *  Two facts order this code:
+ *   - every UI_C_* is a PAIR "text/background", so an exception is a pair too;
+ *   - with FONTA_DRAWBOX GTWVG only the EIGHT base entries of the palette can be
+ *     a background, so the background list is the first eight of the palette and
+ *     the text list is the sixteen.
+ * ===================================================================== */
+
+/* Pair of <nSlot> in the ACTIVE THEME, ignoring the exceptions: it is the value
+ * a Reset goes back to and the "THEME" column of the screen. "" for a slot that
+ * does not exist, like UiC(). */
+FUNCTION UiThemePair( nSlot )
+   LOCAL aCol
+
+   UiThemeInit()
+
+   IF ValType( nSlot ) != "N"
+      RETURN ""
+   ENDIF
+   IF nSlot < 1 .OR. nSlot > TC_COUNT
+      RETURN ""
+   ENDIF
+
+   aCol := s_aUiTheme[ s_nUiTheme ][ 2 ]
+   IF nSlot > Len( aCol )
+      RETURN ""
+   ENDIF
+
+RETURN aCol[ nSlot ]
+
+/* Builds the three tables of this section ONCE (idempotent). The slot table is
+ * read together with bp_def.ch: entry n has to describe the slot n, which is why
+ * the bank checks Len() == TC_COUNT and that every key is unique. */
+FUNCTION UiSlotInit()
+   LOCAL n
+
+   IF ! Empty( s_aUiSlot )
+      RETURN NIL
+   ENDIF
+
+   /* The palette the screen offers. The NAME says what the colour is used for in
+    * the program (it survives a theme change, the RGB does not), and the order of
+    * the first EIGHT is the order of the background list. */
+   s_aUiPal := { ;
+      { "N",   "Black (body)" }, ;
+      { "B",   "Gray (chrome)" }, ;
+      { "G",   "Green (cursor)" }, ;
+      { "BG",  "Cyan (chips)" }, ;
+      { "R",   "Red (bands)" }, ;
+      { "RB",  "Yellow (selection)" }, ;
+      { "GR",  "Brown (bands)" }, ;
+      { "W",   "Light gray (text)" }, ;
+      { "N+",  "Dark gray (dim)" }, ;
+      { "B+",  "Blue (form frame)" }, ;
+      { "G+",  "Bright green (strings)" }, ;
+      { "BG+", "Bright cyan (frames)" }, ;
+      { "R+",  "Bright red (errors)" }, ;
+      { "RB+", "Magenta (preprocessor)" }, ;
+      { "GR+", "Bright yellow (keys)" }, ;
+      { "W+",  "White (bright text)" } ;
+      }
+
+   /* The headings of the screen, in the order they are shown. */
+   s_aUiSlotG := { ;
+      "Screen, panels & bars", ;
+      "Menu bar", ;
+      "Boxes & forms", ;
+      "Dialogs", ;
+      "Records & lists", ;
+      "Structure editor", ;
+      "Index screens", ;
+      "Progress", ;
+      "Splash", ;
+      "Compare", ;
+      "Code", ;
+      "Editor tabs" ;
+      }
+
+   /* { cKey, cLabel, nGroup } per slot, in the order of bp_def.ch. The key is
+    * what hwbro.ini stores (the TC_* name in lower case) and it is the stable
+    * half of the row: the NUMBER of a slot may move if the tables grow, the name
+    * does not. */
+   s_aUiSlot := { ;
+      { "desktop",    "Screen background",        1 }, ;
+      { "menubar",    "Menu bar background",      2 }, ;
+      { "menukey",    "Menu key (F1..F9)",        2 }, ;
+      { "menulbl",    "Menu label",               2 }, ;
+      { "menuact",    "Menu label, active",       2 }, ;
+      { "dark",       "Panel body (panels, editor, browse)", 1 }, ;
+      { "frame1",     "Panel frame, left",        3 }, ;
+      { "frame2",     "Panel frame, right",       3 }, ;
+      { "chip",       "Chip (title, path)",       3 }, ;
+      { "shadowblk",  "Box shadow block",         1 }, ;
+      { "selitem",    "List selection",           3 }, ;
+      { "picked",     "Open database tint",       3 }, ;
+      { "box",        "Box / form body",          3 }, ;
+      { "boxbord",    "Box / form frame",         3 }, ;
+      { "boxsel",     "Option in focus",          3 }, ;
+      { "listsel",    "Cursor / focus highlight",  3 }, ;
+      { "hot",        "Quick letter",             3 }, ;
+      { "hoton",      "Quick letter on dark",     3 }, ;
+      { "boxdim",     "Unavailable option",       3 }, ;
+      { "fieldbg",    "Input field at rest",      3 }, ;
+      { "flatbg",     "Flat control at rest",     3 }, ;
+      { "hotsel",     "Quick letter, in focus",   3 }, ;
+      { "shadow",     "Window shadow",            1 }, ;
+      { "err",        "Error message",            1 }, ;
+      { "status",     "Status line",              1 }, ;
+      { "statusbar",  "Key bar / command line",   1 }, ;
+      { "input",      "Browse input field",       5 }, ;
+      { "hdr",        "Column header (browse, panels)", 5 }, ;
+      { "hdrsel",     "Column header, sorted",    5 }, ;
+      { "rec",        "Record row",               5 }, ;
+      { "recsel",     "Marked entry / current record", 5 }, ;
+      { "dim",        "Dim text / guides",        1 }, ;
+      { "recdel",     "Record, deleted",          5 }, ;
+      { "cursel",     "Cursor cell",              5 }, ;
+      { "edit",       "Cell being edited",        5 }, ;
+      { "titlebar",   "Title bar",                1 }, ;
+      { "green",      "Green bar",                1 }, ;
+      { "hint",       "Hint bar (status row)",    1 }, ;
+      { "splash",     "Splash box",               9 }, ;
+      { "splfrm",     "Splash frame / logo",      9 }, ;
+      { "splshd",     "Splash shadow",            9 }, ;
+      { "splmsg",     "Splash version line",      9 }, ;
+      { "okbtn",      "Splash OK button",         9 }, ;
+      { "stbrd",      "Structure: frame",         6 }, ;
+      { "sttit",      "Structure: title",         6 }, ;
+      { "strow",      "Structure: row",           6 }, ;
+      { "stcur",      "Structure: cursor cell",   6 }, ;
+      { "stsel",      "Structure: current field", 6 }, ;
+      { "dlg",        "Dialog body",              4 }, ;
+      { "dlgbord",    "Dialog frame",             4 }, ;
+      { "dlginfo",    "Dialog label",             4 }, ;
+      { "dlgfield",   "Dialog field",             4 }, ;
+      { "dlgred",     "Dialog field, red",        4 }, ;
+      { "tagdesc",    "Tag screen: block",        6 }, ;
+      { "idxsel",     "Index: selected item",     7 }, ;
+      { "idxfrm",     "Index: right frame",       7 }, ;
+      { "idxitem",    "Index: open index",        7 }, ;
+      { "idxalias",   "Index: alias line",        7 }, ;
+      { "progtit",    "Progress: title",          8 }, ;
+      { "progtxt",    "Progress: counter",        8 }, ;
+      { "progbar",    "Progress: filled bar",     8 }, ;
+      { "progempty",  "Progress: empty bar",      8 }, ;
+      { "cmpbody",    "Compare: text",           10 }, ;
+      { "cmpdim",     "Compare: dim text",       10 }, ;
+      { "cmpmrkd",    "Compare: marker left",    10 }, ;
+      { "cmpmrka",    "Compare: marker right",   10 }, ;
+      { "cmpmrkc",    "Compare: marker changed", 10 }, ;
+      { "cmpword",    "Compare: changed span",   10 }, ;
+      { "cmpbar",     "Compare: bars",           10 }, ;
+      { "cmpon",      "Compare: chip on",        10 }, ;
+      { "cmpoff",     "Compare: chip off",       10 }, ;
+      { "cmptrack",   "Compare: scroll track",   10 }, ;
+      { "cmpthumb",   "Compare: scroll thumb",   10 }, ;
+      { "codekey",    "Code: keyword",           11 }, ;
+      { "codestr",    "Code: string",            11 }, ;
+      { "codecmt",    "Code: comment",           11 }, ;
+      { "codenum",    "Code: number",            11 }, ;
+      { "codefunc",   "Code: function",          11 }, ;
+      { "codepre",    "Code: preprocessor",      11 }, ;
+      { "tablblon",   "Tab: label, active",      12 }, ;
+      { "tablbloff",  "Tab: label, other",       12 }, ;
+      { "tabxact",    "Tab: X, active",          12 }, ;
+      { "tabxoff",    "Tab: X, other",           12 }, ;
+      { "tabxdira",   "Tab: X unsaved, active",  12 }, ;
+      { "tabxdiro",   "Tab: X unsaved, other",   12 }, ;
+      { "tabxhova",   "Tab: X hover, active",    12 }, ;
+      { "tabxhovo",   "Tab: X hover, other",     12 }, ;
+      { "tabbar",     "Tab bar background",      12 }, ;
+      { "tabbrkon",   "Tab: brackets, active",   12 } ;
+      }
+
+   /* the store of the exceptions: one empty string per slot, so it is indexed
+    * like the tables and "no exception" needs no NIL test */
+   IF Empty( s_aUiOv )
+      FOR n := 1 TO Len( s_aUiSlot )
+         AAdd( s_aUiOv, "" )
+      NEXT
+   ENDIF
+
+RETURN NIL
+
+/* ---------- the slot table ---------- */
+
+FUNCTION UiSlotCount()
+   UiSlotInit()
+RETURN Len( s_aUiSlot )
+
+FUNCTION UiSlotKey( nSlot )
+   UiSlotInit()
+   IF nSlot < 1 .OR. nSlot > Len( s_aUiSlot )
+      RETURN ""
+   ENDIF
+RETURN s_aUiSlot[ nSlot ][ 1 ]
+
+FUNCTION UiSlotLabel( nSlot )
+   UiSlotInit()
+   IF nSlot < 1 .OR. nSlot > Len( s_aUiSlot )
+      RETURN ""
+   ENDIF
+RETURN s_aUiSlot[ nSlot ][ 2 ]
+
+FUNCTION UiSlotGroup( nSlot )
+   UiSlotInit()
+   IF nSlot < 1 .OR. nSlot > Len( s_aUiSlot )
+      RETURN 0
+   ENDIF
+RETURN s_aUiSlot[ nSlot ][ 3 ]
+
+/* the slot a key of hwbro.ini stands for, or 0. The NAME is tried first and a
+ * plain number is accepted as a fallback, so a file written by hand with `6=N/W`
+ * also works; anything else - and the name of a slot that no longer exists - is
+ * ignored by the caller instead of breaking the program. */
+FUNCTION UiSlotByKey( cKey )
+   LOCAL i, n
+   LOCAL c := Upper( AllTrim( iif( ValType( cKey ) == "C", cKey, "" ) ) )
+
+   UiSlotInit()
+
+   IF Len( c ) == 0
+      RETURN 0
+   ENDIF
+
+   FOR i := 1 TO Len( s_aUiSlot )
+      IF Upper( s_aUiSlot[ i ][ 1 ] ) == c
+         RETURN i
+      ENDIF
+   NEXT
+
+   n := Val( c )
+   IF n >= 1 .AND. n <= Len( s_aUiSlot ) .AND. AllTrim( Str( n ) ) == c
+      RETURN n
+   ENDIF
+
+RETURN 0
+
+/* ---------- the groups ---------- */
+
+FUNCTION UiSlotGroupNames()
+   UiSlotInit()
+RETURN s_aUiSlotG
+
+FUNCTION UiSlotGroupName( nGroup )
+   UiSlotInit()
+   IF nGroup < 1 .OR. nGroup > Len( s_aUiSlotG )
+      RETURN ""
+   ENDIF
+RETURN s_aUiSlotG[ nGroup ]
+
+/* The rows of the screen, in display order: { 1, nGroup } for a heading and
+ * { 2, nSlot } for an element. Grouped here - and not by walking the slots in
+ * order - so a heading appears ONCE even though its slots are spread over
+ * bp_def.ch; the order inside a group is the order of the slots, which keeps the
+ * list stable. A heading is not a stop: the screen and the bank skip it with
+ * UiSlotRowStep(). */
+FUNCTION UiSlotRows()
+   LOCAL aRow := {}
+   LOCAL nG, n, nId, lHead
+
+   UiSlotInit()
+
+   FOR nG := 1 TO Len( s_aUiSlotG )
+      lHead := .F.
+      FOR n := 1 TO Len( s_aUiSlot )
+         nId := s_aUiSlot[ n ][ 3 ]
+         IF nId == nG
+            IF ! lHead
+               AAdd( aRow, { 1, nG } )
+               lHead := .T.
+            ENDIF
+            AAdd( aRow, { 2, n } )
+         ENDIF
+      NEXT
+   NEXT
+
+RETURN aRow
+
+/* the next ELEMENT of <aRow> in direction <nDir> from <nFrom>, wrapping
+ * backwards/forwards is NOT done here: at the end it answers <nFrom>, which is
+ * what the caller needs to keep the cursor where it was. */
+FUNCTION UiSlotRowStep( aRow, nFrom, nDir )
+   LOCAL n := nFrom + nDir
+
+   IF ! HB_ISARRAY( aRow ) .OR. nDir == 0
+      RETURN nFrom
+   ENDIF
+
+   DO WHILE n >= 1 .AND. n <= Len( aRow )
+      IF aRow[ n ][ 1 ] == 2
+         RETURN n
+      ENDIF
+      n += nDir
+   ENDDO
+
+RETURN nFrom
+
+/* first and last ELEMENT row of the list */
+FUNCTION UiSlotRowEdge( aRow, lLast )
+   LOCAL n
+
+   IF ! HB_ISARRAY( aRow )
+      RETURN 0
+   ENDIF
+
+   IF lLast
+      FOR n := Len( aRow ) TO 1 STEP -1
+         IF aRow[ n ][ 1 ] == 2
+            RETURN n
+         ENDIF
+      NEXT
+   ELSE
+      FOR n := 1 TO Len( aRow )
+         IF aRow[ n ][ 1 ] == 2
+            RETURN n
+         ENDIF
+      NEXT
+   ENDIF
+
+RETURN 0
+
+/* ---------- the palette ---------- */
+
+/* { { cLetter, cName }, ... } x 16: every colour a TEXT can use */
+FUNCTION UiPaletteFg()
+   LOCAL a := {}, i
+
+   UiSlotInit()
+   FOR i := 1 TO Len( s_aUiPal )
+      AAdd( a, { s_aUiPal[ i ][ 1 ], s_aUiPal[ i ][ 2 ] } )
+   NEXT
+
+RETURN a
+
+/* { { cLetter, cName }, ... } x 16: every colour a BACKGROUND can use. The
+ * eight BASE ones are the palette letters; the eight BRIGHT ones are the same
+ * letters with a STAR (`N* B* G* BG* R* RB* GR* W*`), which is how this driver
+ * paints an intense surface.
+ *
+ * THE WHOLE COLOUR SPACE IS 16 x 16 = 256 ATTRIBUTES (the table the user handed
+ * over). Two bits build them, and they are POSITION-FREE:
+ *   hbgtcore.c:  '+' -> nColor |= 0x08 (the bright bit of the TEXT nibble)
+ *                '*' -> nColor |= 0x80 (the high bit of the BACKGROUND nibble)
+ *   gtwvgd.c:    SetBkColor( hdc, COLORS[ ( iColor >> 4 ) & 0x0F ] )
+ * so 16 inks x 16 surfaces all paint, and `N+/B`/`N/B+` are the same attribute,
+ * as are `N/W*` and the same star written in the text half (measured:
+ * ColorToN() gives 0x18 and 0xF0 in both cases; hb_NToColor() answers the
+ * canonical form, `N+/B` and `N/W*`).
+ *
+ * On real VGA TEXT MODE the top bit is BLINK, so a DOS screen has 16 inks and
+ * only 8 surfaces; this clone is a GDI window (gtwvg) with no blink code, which
+ * is why the star really paints here. MEASURED with the palette of the theme
+ * (PrintWindow, and six captures 250 ms apart to rule a blink out - identical):
+ *    N/W  185,185,192      N/W*  245,245,250     (Dark)
+ *    N/N   18,18,22        N/N*  110,110,120
+ *    N/B   40,40,46        N/B*   95,95,215
+ * The screen shows the 256 as a matrix, one cell per attribute (see
+ * BpThemeColors), and UiPairSplit() puts each bit in its own half, so a pair
+ * written in any of the four ways ends up in the canonical one. */
+FUNCTION UiPaletteBg()
+   LOCAL a := {}, i
+   LOCAL aBr := { "Bright black", "Bright gray", "Bright green", "Bright cyan", ;
+                  "Bright red", "Bright yellow", "Bright brown", "Bright white" }
+
+   UiSlotInit()
+   FOR i := 1 TO 8
+      AAdd( a, { s_aUiPal[ i ][ 1 ], s_aUiPal[ i ][ 2 ] } )
+   NEXT
+   FOR i := 1 TO 8
+      AAdd( a, { s_aUiPal[ i ][ 1 ] + "*", aBr[ i ] } )
+   NEXT
+
+RETURN a
+
+/* the name of a palette letter, or "" for something that is not one. A
+ * BACKGROUND letter may carry the star of the bright halves (`W*`). */
+FUNCTION UiPaletteName( cLetter )
+   LOCAL i, aBr
+   LOCAL c := iif( ValType( cLetter ) == "C", Upper( AllTrim( cLetter ) ), "" )
+
+   UiSlotInit()
+
+   IF Right( c, 1 ) == "*"
+      aBr := { "Bright black", "Bright gray", "Bright green", "Bright cyan", ;
+               "Bright red", "Bright yellow", "Bright brown", "Bright white" }
+      FOR i := 1 TO 8
+         IF s_aUiPal[ i ][ 1 ] + "*" == c
+            RETURN aBr[ i ]
+         ENDIF
+      NEXT
+      RETURN ""
+   ENDIF
+
+   FOR i := 1 TO Len( s_aUiPal )
+      IF s_aUiPal[ i ][ 1 ] == c
+         RETURN s_aUiPal[ i ][ 2 ]
+      ENDIF
+   NEXT
+
+RETURN ""
+
+/* The colour of the LETTER painted over a swatch of <cLetter>: a fixed light
+ * foreground on the dark entries and black on the rest. Text mode has no
+ * contrast test, so this is a table and it never needs a driver: the answer is
+ * always a valid FOREGROUND letter. */
+FUNCTION UiPalContrast( cLetter )
+   LOCAL c := Upper( AllTrim( iif( ValType( cLetter ) == "C", cLetter, "" ) ) )
+
+   /* a surface with the star is the bright entry of its colour (`W*` lights like
+    * `W+`), so it needs the contrast of that entry */
+   IF Right( c, 1 ) == "*"
+      c := Left( c, Len( c ) - 1 ) + "+"
+   ENDIF
+
+   DO CASE
+   CASE c == "N"  ; RETURN "W+"
+   CASE c == "B"  ; RETURN "W+"
+   CASE c == "N+" ; RETURN "W+"
+   CASE c == "GR" ; RETURN "W+"
+   ENDCASE
+RETURN "N"
+
+/* The PAIR a swatch of the palette is painted with. A BASE or BRIGHT surface
+ * (`N B G BG R RB GR W` / `N* … W*`) is painted as the BACKGROUND with a
+ * contrasting letter on top, which is how it will look on screen. A BRIGHT
+ * colour of the TEXT row (`N+ … W+`) is painted as INK over black: the plus
+ * brightens the LETTER (hbgtcore.c decodes it as `nColor |= 0x08`, in the
+ * foreground nibble), so it is not a surface. */
+FUNCTION UiPalSwatchPair( cLetter )
+   LOCAL c := Upper( AllTrim( iif( ValType( cLetter ) == "C", cLetter, "" ) ) )
+
+   IF Right( c, 1 ) == "*"
+      /* a bright SURFACE: the star goes at the end of the pair */
+      RETURN UiPalContrast( c ) + "/" + c
+   ENDIF
+   IF ! UiPairFgOk( c )
+      RETURN ""
+   ENDIF
+   IF Right( c, 1 ) == "+"
+      RETURN c + "/N"
+   ENDIF
+
+RETURN UiPalContrast( c ) + "/" + c
+
+/* ---------- the pairs ---------- */
+
+FUNCTION UiPairFgOk( cFg )
+   LOCAL i
+   LOCAL c := iif( ValType( cFg ) == "C", Upper( AllTrim( cFg ) ), "" )
+
+   UiSlotInit()
+   IF Len( c ) == 0
+      RETURN .F.
+   ENDIF
+   FOR i := 1 TO Len( s_aUiPal )
+      IF s_aUiPal[ i ][ 1 ] == c
+         RETURN .T.
+      ENDIF
+   NEXT
+
+RETURN .F.
+
+FUNCTION UiPairBgOk( cBg )
+   LOCAL i
+   LOCAL c := iif( ValType( cBg ) == "C", Upper( AllTrim( cBg ) ), "" )
+
+   UiSlotInit()
+   IF Len( c ) == 0
+      RETURN .F.
+   ENDIF
+   /* the surface half: one of the eight base letters, or the same with the star
+    * of the bright ones (`W*`). A PLUS here is the OTHER marker - it brightens
+    * the ink - so it is accepted and UiPairSplit() moves it to the text half
+    * (hbgtcore.c: the bits are position-free). */
+   IF Right( c, 1 ) == "*" .OR. Right( c, 1 ) == "+"
+      c := Left( c, Len( c ) - 1 )
+   ENDIF
+   FOR i := 1 TO 8
+      IF s_aUiPal[ i ][ 1 ] == c
+         RETURN .T.
+      ENDIF
+   NEXT
+
+RETURN .F.
+
+/* "W+/N" -> { "W+", "N" }, or {} when it is not a pair this program can paint
+ * (wrong number of slashes, a letter outside the palette). The vocabulary is the
+ * whole 16 x 16 space of the driver - 16 inks (the bright ones with `+`) and 16
+ * surfaces (the bright ones with `*`) - and the answer is CANONICAL: a marker
+ * written in the wrong half is moved to its own (a star in the text half over
+ * `W` becomes `N/W*`, and `N/B+` becomes `N+/B`), because the two bits are
+ * position-free in the driver. */
+FUNCTION UiPairSplit( cPair )
+   LOCAL n
+   LOCAL cFg, cBg
+   LOCAL lFgBright := .F., lBgBright := .F.
+   LOCAL c := iif( ValType( cPair ) == "C", AllTrim( cPair ), "" )
+
+   IF Len( c ) == 0
+      RETURN {}
+   ENDIF
+
+   n := At( "/", c )
+   IF n <= 1 .OR. n >= Len( c )
+      RETURN {}
+   ENDIF
+   IF At( "/", SubStr( c, n + 1 ) ) > 0
+      RETURN {}
+   ENDIF
+
+   cFg := Left( c, n - 1 )
+   cBg := SubStr( c, n + 1 )
+
+   /* The two bits are POSITION-FREE: '+' is the bright bit of the ink and '*' is
+    * the high bit of the surface (hbgtcore.c: 0x08 and 0x80), so `N+/B`,
+    * `N/B+` and the same star written in the text half all describe the same
+    * attribute (measured: ColorToN() gives the same byte for each pair of
+    * forms). Take each marker from wherever it was written and put it in ITS
+    * half, so the store always holds the canonical form (`N+/B`, `N/W*`). */
+   IF "*" $ cFg
+      lBgBright := .T.
+      cFg := StrTran( cFg, "*", "" )
+   ENDIF
+   IF "*" $ cBg
+      lBgBright := .T.
+      cBg := StrTran( cBg, "*", "" )
+   ENDIF
+   IF "+" $ cFg
+      lFgBright := .T.
+      cFg := StrTran( cFg, "+", "" )
+   ENDIF
+   IF "+" $ cBg
+      lFgBright := .T.
+      cBg := StrTran( cBg, "+", "" )
+   ENDIF
+
+   IF ! UiPairFgOk( cFg ) .OR. ! UiPairBgOk( cBg )
+      RETURN {}
+   ENDIF
+
+   cFg := Upper( AllTrim( cFg ) )
+   cBg := Upper( AllTrim( cBg ) )
+   IF lFgBright
+      cFg += "+"
+   ENDIF
+   IF lBgBright
+      cBg += "*"
+   ENDIF
+
+RETURN { cFg, cBg }
+
+FUNCTION UiPairOk( cPair )
+RETURN ! Empty( UiPairSplit( cPair ) )
+
+/* the canonical pair, or "" when the two letters cannot make one. It goes
+ * through UiPairSplit() and NOT through a pre-check of each half: a half may
+ * carry the marker of the OTHER half (`N*`, `W+`), and it is Split that moves
+ * each bit where it belongs, exactly as the driver reads it. */
+FUNCTION UiPairMake( cFg, cBg )
+   LOCAL a
+
+   IF ValType( cFg ) != "C" .OR. ValType( cBg ) != "C"
+      RETURN ""
+   ENDIF
+   a := UiPairSplit( AllTrim( cFg ) + "/" + AllTrim( cBg ) )
+   IF Empty( a )
+      RETURN ""
+   ENDIF
+RETURN a[ 1 ] + "/" + a[ 2 ]
+
+/* ---------- the store of exceptions ---------- */
+
+/* Is there an exception on <nSlot>? */
+FUNCTION UiOvHas( nSlot )
+   IF nSlot < 1 .OR. nSlot > Len( s_aUiOv )
+      RETURN .F.
+   ENDIF
+RETURN ! Empty( s_aUiOv[ nSlot ] )
+
+/* the exception of <nSlot>, or "" when that slot follows the theme */
+FUNCTION UiOvGet( nSlot )
+   IF nSlot < 1 .OR. nSlot > Len( s_aUiOv )
+      RETURN ""
+   ENDIF
+RETURN s_aUiOv[ nSlot ]
+
+/* pins <cPair> on <nSlot>. Answers .F. - changing NOTHING - for a slot that does
+ * not exist or a pair that cannot be painted, so a bad call can never leave a
+ * slot with a colour SetColor() would reject. */
+FUNCTION UiOvSet( nSlot, cPair )
+   LOCAL a := UiPairSplit( cPair )
+   LOCAL c
+
+   UiSlotInit()
+
+   IF ValType( nSlot ) != "N" .OR. nSlot < 1 .OR. nSlot > Len( s_aUiSlot )
+      RETURN .F.
+   ENDIF
+   IF Empty( a )
+      RETURN .F.
+   ENDIF
+
+   c := a[ 1 ] + "/" + a[ 2 ]
+   s_aUiOv[ nSlot ] := c
+
+RETURN .T.
+
+/* the slot goes back to the pair of the theme in force */
+FUNCTION UiOvClear( nSlot )
+   UiSlotInit()
+   IF nSlot < 1 .OR. nSlot > Len( s_aUiOv )
+      RETURN .F.
+   ENDIF
+   s_aUiOv[ nSlot ] := ""
+RETURN .T.
+
+FUNCTION UiOvClearAll()
+   LOCAL i
+   UiSlotInit()
+   FOR i := 1 TO Len( s_aUiOv )
+      s_aUiOv[ i ] := ""
+   NEXT
+RETURN NIL
+
+FUNCTION UiOvCount()
+   LOCAL i, n := 0
+   FOR i := 1 TO Len( s_aUiOv )
+      IF ! Empty( s_aUiOv[ i ] )
+         n++
+      ENDIF
+   NEXT
+RETURN n
+
+/* { { cKey, cPair }, ... } of the exceptions ONLY, in slot order: it is what
+ * hwbro.ini stores, and the reason saving writes just the exceptions. */
+FUNCTION UiOvList()
+   LOCAL a := {}, i
+   UiSlotInit()
+   FOR i := 1 TO Len( s_aUiOv )
+      IF ! Empty( s_aUiOv[ i ] )
+         AAdd( a, { s_aUiSlot[ i ][ 1 ], s_aUiOv[ i ] } )
+      ENDIF
+   NEXT
+RETURN a
+
+/* applies { { cKey, cPair }, ... }. Every row is validated on its own and a row
+ * that cannot be painted - unknown slot, a colour outside the palette, a bright
+ * background - is IGNORED, so a hand-edited file can lose at most its own line.
+ * Answers how many were applied. */
+FUNCTION UiOvLoad( aList )
+   LOCAL i, n := 0, nSlot, cPair, a
+   LOCAL cKey
+
+   UiSlotInit()
+
+   IF ! HB_ISARRAY( aList )
+      RETURN 0
+   ENDIF
+
+   FOR i := 1 TO Len( aList )
+      IF ! HB_ISARRAY( aList[ i ] ) .OR. Len( aList[ i ] ) < 2
+         LOOP
+      ENDIF
+      cKey  := aList[ i ][ 1 ]
+      cPair := aList[ i ][ 2 ]
+      a     := UiPairSplit( cPair )
+      IF Empty( a )
+         LOOP
+      ENDIF
+      nSlot := UiSlotByKey( cKey )
+      IF nSlot == 0
+         LOOP
+      ENDIF
+      s_aUiOv[ nSlot ] := a[ 1 ] + "/" + a[ 2 ]
+      n++
+   NEXT
+
+RETURN n
+
+/* A COPY of the store, element by element (Harbour arrays are references, AGENTS
+ * trap 67): the screen takes one on entry so Cancel can put back exactly what
+ * there was, without ACopy( a, {} ) - which copies nothing (trap 33). */
+FUNCTION UiOvSnapshot()
+   LOCAL a := {}, i
+   FOR i := 1 TO Len( s_aUiOv )
+      AAdd( a, s_aUiOv[ i ] )
+   NEXT
+RETURN a
+
+FUNCTION UiOvRestore( aSave )
+   LOCAL i
+   IF ! HB_ISARRAY( aSave )
+      RETURN .F.
+   ENDIF
+   FOR i := 1 TO Min( Len( s_aUiOv ), Len( aSave ) )
+      s_aUiOv[ i ] := aSave[ i ]
+   NEXT
+RETURN .T.
 
 FUNCTION UiClr( cName )
    DO CASE
@@ -2849,6 +3589,7 @@ RETURN cRes
 FUNCTION UiPick( aItems, cTitle, nStart, nT, nL, nH )
    LOCAL nB, nR, nSel, nKey, i, cSave, nScroll := 1, nMax := 0
    LOCAL nOldSel, nOldScroll
+   LOCAL cOldCur
    DEFAULT cTitle TO "" ; DEFAULT nStart TO 1 ; DEFAULT nT TO -1
    DEFAULT nL TO -1 ; DEFAULT nH TO Min( 24, UiRows() - 6 )
    IF Empty( aItems )
@@ -2870,6 +3611,13 @@ FUNCTION UiPick( aItems, cTitle, nStart, nT, nL, nH )
    nT := UiFitRow( nT, nB + 1 )
    nL := UiFitCol( nL, nR + 2 )
    nSel := Min( Max( nStart, 1 ), Len( aItems ) )
+   /* the system cursor stays hidden the WHOLE time the box is on screen:
+    * UiPaintBegin/End only hides it while painting, so while the list waited for
+    * a key (Inkey) the caret blinked at the end of the last painted row - the
+    * "blinking cursor" of the Alt-F1/F2 picker. It is done BEFORE the first
+    * UiPaintBegin so the painting block saves/restores the already hidden state
+    * (the same recipe as UiMsg()/UiConfirm()). */
+   cOldCur := SetCursor( 0 )
    cSave := SaveScreen( nT, nL, nT + nB + 1, Min( nL + nR + 2, MaxCol() ) )
    /* the box is drawn only once; on every move only the affected list
     * rows are repainted (no filling of the whole box) */
@@ -2967,6 +3715,9 @@ FUNCTION UiPick( aItems, cTitle, nStart, nT, nL, nH )
    ENDDO
    SetColor( UI_C_DESKTOP )
    RestScreen( nT, nL, nT + nB + 1, Min( nL + nR + 2, MaxCol() ), cSave )
+   /* the caret comes back as it was before the list (it was blinking over the
+    * box: see the SetCursor( 0 ) at the top) */
+   SetCursor( cOldCur )
 RETURN nSel
 
 /* draw one row of the UiPick list (1..nH) */
@@ -2991,6 +3742,7 @@ RETURN NIL
  * with Esc or Enter). The usual callers (BpHelp, BpHotKeys) do not pass them. */
 FUNCTION UiTextWin( aLines, cTitle, aActions )
    LOCAL nTop := 0, nKey, nT, nB, nL, nR, nMax := 0, i, cSave, nVis, cHint, cAct := ""
+   LOCAL cOldCur
    DEFAULT cTitle TO "Info"
    DEFAULT aActions TO {}
    cHint := "<Up/Down/PgUp/PgDn/Home/End>  <Esc> " + iif( Empty( aActions ), "exit", "close" )
@@ -3006,6 +3758,9 @@ FUNCTION UiTextWin( aLines, cTitle, aActions )
    nT := 1 ; nB := MaxRow() - 1
    nR := Min( nMax + 4, UiCols() - 6 )
    nL := UiFitCol( UiCenterCol( nR ), nR + 2 )
+   /* the caret stays hidden while the window waits for a key (UiPaintBegin/End
+    * only hide it while painting): the same reason and recipe as UiPick() */
+   cOldCur := SetCursor( 0 )
    cSave := SaveScreen( nT, nL, nB + 1, Min( nL + nR + 2, MaxCol() ) )
    nVis := nB - nT - 2
    /* fixed frame; when scrolling only the text lines are repainted */
@@ -3066,6 +3821,7 @@ FUNCTION UiTextWin( aLines, cTitle, aActions )
       ENDCASE
    ENDDO
    RestScreen( nT, nL, nB + 1, Min( nL + nR + 2, MaxCol() ), cSave )
+   SetCursor( cOldCur )
 RETURN cAct
 
 /* ---------- conversion of field values to/from text ---------- */
